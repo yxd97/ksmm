@@ -626,9 +626,9 @@ def cmd_nsys_parse(args) -> None:
     gpu = {}
     if "CUPTI_ACTIVITY_KIND_KERNEL" in tables:
         for start, end, corr, name_id, gx, gy, gz, bx, by, bz in cur.execute(
-                "SELECT start, end, correlationId, shortName, gridX, gridY, gridZ, blockX, blockY, blockZ "
+                "SELECT start, end, correlationId, demangledName, gridX, gridY, gridZ, blockX, blockY, blockZ "
                 "FROM CUPTI_ACTIVITY_KIND_KERNEL"):
-            gpu.setdefault(corr, []).append((start, end, strings.get(name_id, "?"), f"{gx}x{gy}x{gz}",
+            gpu.setdefault(corr, []).append((start, end, short_name(strings.get(name_id, "?")), f"{gx}x{gy}x{gz}",
                                              f"{bx}x{by}x{bz}"))
     for table, kind in (("CUPTI_ACTIVITY_KIND_MEMSET", "memset"), ("CUPTI_ACTIVITY_KIND_MEMCPY", "memcpy")):
         if table in tables:
