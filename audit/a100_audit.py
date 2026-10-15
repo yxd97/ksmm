@@ -59,8 +59,8 @@ WARMUP_MS, REP_MS = 25, 100  # same as the old harness and triton's defaults
 FLUSH_BYTES = 256 * 1024 * 1024  # same size as triton do_bench's L2-clearing buffer
 SLEEP_CYCLES = 100_000  # about 70 us at 1410 MHz
 TOL_REL_L2 = 1e-2  # pass threshold on ||y - y_ref||_2 / ||y_ref||_2
-# Largest fp32 composed matrix built by multiplying the stage matrices (65536 x 65536,
-# the T4 and T7-phase-1 sizes). Larger chains (T7 phase 2, up to 2^20 points) get the
+# Largest fp32 matrix (a stage matrix or the running product) of the composition by
+# multiplying the stage matrices (65536 x 65536, the T4 and T7-phase-1 sizes). Larger chains (T7 phase 2, up to 2^20 points) get the
 # fp32 reference stage by stage and the cuBLAS fp16 matrix column block by column block.
 DENSE32_MAX_BYTES = 16 << 30
 BLOCK_BYTES = 1 << 30  # fp32 identity block per column block of the fp16 composition
@@ -161,7 +161,9 @@ class Built:
         # KSMM layout: K[a*D + d, c, b] = W[a, b, c, d]
         self.k_bmm = [w.permute(0, 3, 2, 1).reshape(a * d, c, b).contiguous()
                       for w, (a, b, c, d) in zip(self.w4, chain.stages)]
-        small = chain.n_out * chain.m_in * 4 <= DENSE32_MAX_BYTES
+        # _compose holds a stage matrix (out_k x in_k) and the running product (out_k x M_in)
+        small = max(max(a * b * d * a * c * d, a * b * d * chain.m_in)
+                    for a, b, c, d in chain.stages) * 4 <= DENSE32_MAX_BYTES
         self.dense32 = self._compose(torch) if small else None
         if small:
             self._self_check(torch)
