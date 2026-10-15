@@ -143,8 +143,9 @@ class Inputs:
 
 
 def floor_constants(inp: Inputs) -> tuple[dict, list[dict]]:
-    rows = [r for r in jsonl(inp.t8 / "floor.jsonl") if r["kind"] != "provenance"]
-    c: dict = {}
+    recs = jsonl(inp.t8 / "floor.jsonl")
+    rows = [r for r in recs if r["kind"] != "provenance"]
+    c: dict = {"flush_us": next(r["flush_us_median"] for r in recs if r["kind"] == "provenance")}
     for kind, tag in (("empty", "empty"), ("ksmm_1cta", "1cta")):
         pts = sorted((r["kernels"], r["gc_mean"], r["gw_mean"]) for r in rows if r["kind"] == kind)
         a, b = fit([p[0] for p in pts], [p[1] for p in pts])
@@ -154,7 +155,10 @@ def floor_constants(inp: Inputs) -> tuple[dict, list[dict]]:
     c["graph_launch_us"] = c["empty_launch_us"]          # G_cold window before / around the first kernel
     c["kernel_floor_us"] = c["empty_per_kernel_us"]      # one empty kernel inside a graph (incl. its gap)
     c["ksmm_1cta_us"] = c["1cta_per_kernel_us"]          # one one-CTA KSMM kernel inside a graph
-    c["ksmm_latency_us"] = c["ksmm_1cta_us"] - c["kernel_floor_us"]
+    # one-CTA KSMM kernel minus an empty kernel: parameters (imc_miss), barrier, L2 / DRAM access, MMA (not split);
+    # the cold - warm part of it is what DRAM costs over L2
+    c["ksmm_onecta_extra_us"] = c["ksmm_1cta_us"] - c["kernel_floor_us"]
+    c["ksmm_onecta_extra_warm_us"] = c["1cta_per_kernel_warm_us"] - c["empty_per_kernel_warm_us"]
     curve = []
     by = defaultdict(dict)
     for r in rows:
@@ -235,7 +239,19 @@ def chain_work(stages, impl: str, batch: int, csr_nnz: float) -> dict:
             "stage_act_bytes_max": act}
 
 
-def classify(impl, tc_share, bw_share, fix_share) -> str:
+def classify(impl, tc_share, bw_share, fix_share, n: dict) -> tuple[str, str]:
+    """(regime, basis). KSMM's byte estimate (no inter-stage reuse) is an upper bound on DRAM bytes, so a KSMM
+    point is called bandwidth bound only when ncu measured DRAM >= 50 %; otherwise it stays CTA throughput."""
+    if impl == "ksmm" and tc_share < TC_SHARE and bw_share >= BW_SHARE:
+        if not n:
+            return R_SM, "规则；带宽估算 ≥ 30% 但没有 ncu，未核实"
+        if n["ncu_dram_pct"] >= 50:
+            return R_BW, "ncu DRAM ≥ 50%"
+        return R_SM, "带宽估算 ≥ 30%，ncu DRAM < 50%，按 ncu 改判"
+    return _rule(impl, tc_share, bw_share, fix_share), "规则"
+
+
+def _rule(impl, tc_share, bw_share, fix_share) -> str:
     if tc_share >= TC_SHARE:
         return R_TC
     if bw_share >= BW_SHARE:
@@ -251,8 +267,10 @@ def ncu_check(regime: str, n: dict) -> str:
     dram, sm, tc = n["ncu_dram_pct"], n["ncu_sm_pct"], n["ncu_tensor_pct"]
     # the fixed / CTA-throughput boundary comes from the timing decomposition (floor probe); ncu checks that neither
     # is memory bound and that SM load is low in the first and higher in the second (the two ranges overlap on purpose)
-    ok = {R_FIX: dram < 10 and sm < 50, R_SM: dram < 30 and sm >= 30, R_BW: dram >= 50,
-          R_TC: tc >= 50, R_MID: True}[regime]
+    if regime == R_MID:
+        return "无核对条件"
+    ok = {R_FIX: dram < 10 and sm < 50, R_SM: sm >= 30 and sm >= dram, R_BW: dram >= 50,
+          R_TC: tc >= 50}[regime]
     return "一致" if ok else "不一致"
 
 
@@ -285,8 +303,8 @@ def regimes(inp: Inputs, c: dict, ncu: dict) -> list[dict]:
         tc_share = 2 * w["macs"] / (g * 1e-6) / PEAK_TC
         bw_share = w["bytes_est"] / (g * 1e-6) / PEAK_BW
         fix_share = min(1.0, fixed / g)
-        reg = classify(impl, tc_share, bw_share, fix_share)
         n = ncu.get((ds, name, impl, batch), {})
+        reg, basis = classify(impl, tc_share, bw_share, fix_share, n)
         ctas = (sum(a * d for a, _b, _c, d in stages) / len(stages)) * math.ceil(batch / 32) if impl == "ksmm" else ""
         out.append({
             "dataset": ds, "chain": name, "impl": impl, "batch": batch, "stages": len(stages), "kernels": k,
@@ -298,7 +316,7 @@ def regimes(inp: Inputs, c: dict, ncu: dict) -> list[dict]:
             "nsys_e_idle_share": e_idle.get((ds, name, impl), "") if batch == 1 else "",
             "per_kernel_us": (g - c["graph_launch_us"]) / k if impl == "ksmm" else "",
             "floor_us": fixed, "fixed_share": fix_share, "bw_share": bw_share, "tc_share": tc_share,
-            "device_regime": reg, **{key: n.get(key, "") for key in (
+            "device_regime": reg, "regime_basis": basis, **{key: n.get(key, "") for key in (
                 "ncu_dram_pct", "ncu_sm_pct", "ncu_tensor_pct", "ncu_occ_pct", "ncu_l2_hit_pct", "ncu_waves_max",
                 "ncu_source")},
             "ncu_agrees": ncu_check(reg, n), "ksmm_configs": m["ksmm_configs"]})
@@ -334,13 +352,13 @@ def stage_compare(inp: Inputs, c: dict) -> tuple[list[dict], list[dict]]:
                    "v41_ns": cyc, **{f"v41_{p}_ns": cyc * x / s for p, x in parts.items()},
                    "gpu_nsys_ns": knsys * 1000, "gpu_ns": t * 1000,
                    "gpu_floor_ns": c["kernel_floor_us"] * 1000,
-                   "gpu_latency_ns": c["ksmm_latency_us"] * 1000,
+                   "gpu_onecta_extra_ns": c["ksmm_onecta_extra_us"] * 1000,
                    "gpu_cta_ns": (t - c["ksmm_1cta_us"]) * 1000,
                    "gpu_bw_peak_ns": 2 * (a * b * cc * d + a * cc * d + a * b * d) / PEAK_BW * 1e9,
                    "gpu_tc_peak_ns": 2 * a * b * cc * d / PEAK_TC * 1e9,
                    "ratio_gpu_v41": t * 1000 / cyc}
             stage_rows.append(row)
-            for key in ("v41_ns", "gpu_ns", "gpu_floor_ns", "gpu_latency_ns", "gpu_cta_ns", "gpu_bw_peak_ns",
+            for key in ("v41_ns", "gpu_ns", "gpu_floor_ns", "gpu_onecta_extra_ns", "gpu_cta_ns", "gpu_bw_peak_ns",
                         "gpu_tc_peak_ns", "v41_compute_ns", "v41_memory_ns", "v41_movement_ns", "v41_control_ns",
                         "v41_idle_ns"):
                 tot[key] += row[key]
@@ -348,13 +366,14 @@ def stage_compare(inp: Inputs, c: dict) -> tuple[list[dict], list[dict]]:
         chain_rows.append({
             "dataset": ds, "chain": name, "stages": len(stages), "nnz_ratio_padded": res.get("nnz_ratio_padded", ""),
             "g_cold_us": g, "graph_launch_us": L, "kernel_floor_us": tot["gpu_floor_ns"] / 1000,
-            "latency_us": tot["gpu_latency_ns"] / 1000, "cta_us": tot["gpu_cta_ns"] / 1000,
+            "onecta_extra_us": tot["gpu_onecta_extra_ns"] / 1000, "cta_us": tot["gpu_cta_ns"] / 1000,
             "bw_peak_us": tot["gpu_bw_peak_ns"] / 1000, "tc_peak_us": tot["gpu_tc_peak_ns"] / 1000,
             "v41_us": v41_total / 1000, "v41_stage_sum_us": tot["v41_ns"] / 1000,
             **{f"v41_{p}_us": tot[f"v41_{p}_ns"] / 1000 for p in ("compute", "memory", "movement", "control", "idle")},
             "ratio": g * 1000 / v41_total,
             "share_launch": L / g, "share_floor": tot["gpu_floor_ns"] / 1000 / g,
-            "share_latency": tot["gpu_latency_ns"] / 1000 / g, "share_cta": tot["gpu_cta_ns"] / 1000 / g,
+            "share_onecta_extra": tot["gpu_onecta_extra_ns"] / 1000 / g, "share_cta": tot["gpu_cta_ns"] / 1000 / g,
+            "share_fixed_total": (L + tot["gpu_floor_ns"] / 1000 + tot["gpu_onecta_extra_ns"] / 1000) / g,
             "per_stage_gpu_us": (g - L) / len(stages), "per_stage_v41_us": v41_total / 1000 / len(stages)})
     return stage_rows, chain_rows
 
@@ -362,8 +381,17 @@ def stage_compare(inp: Inputs, c: dict) -> tuple[list[dict], list[dict]]:
 # --------------------------------------------------------------------------- launch removed
 
 
-def launch_removed(inp: Inputs, c: dict) -> list[dict]:
-    out = []
+def launch_removed(inp: Inputs, c: dict, fb: list[dict]) -> list[dict]:
+    """A100 / V4.1 under each view, KSMM batch 1, plus E - G_cold split into an eager device-side part and the
+    host issue time that shows in E.
+
+    E's window starts after a ~150 us L2 flush during which the host keeps issuing. Chains whose whole issue time
+    h_us is shorter than the flush have nothing of the host left in E: their E - G_cold is the device-side
+    difference between eager and graph launches (eager kernels run longer and are ~1 us apart; the graph adds
+    its own start). A line in the number of stages fitted on those chains estimates that device part for the
+    longer chains (an extrapolation); the rest of E - G_cold is host issue time showing in E.
+    """
+    rows = []
     for ds in DATASETS:
         ks = inp.results.get((ds, "ksmm"), {})
         cb = inp.results.get((ds, "cublas"), {})
@@ -372,21 +400,80 @@ def launch_removed(inp: Inputs, c: dict) -> list[dict]:
                 continue
             k = len(inp.chains[(ds, name)])
             v = float(inp.v41[(ds, name)]["cycles"]) / 1000
-            g, gw, e = num(r["time_us"]), num(r.get("g_warm_us")), num(r.get("e_p50"))
+            g, gw = num(r["time_us"]), num(r.get("g_warm_us"))
             cg = num(cb.get(name, {}).get("time_us"))
             cgw = num(cb.get(name, {}).get("g_warm_us"))
-            floor = c["graph_launch_us"] + k * c["ksmm_1cta_us"]
-            best = min(x for x in (g, cg) if not math.isnan(x))
-            out.append({"dataset": ds, "chain": name, "stages": k, "v41_us": v,
-                        "ksmm_e_p50_us": e, "ksmm_g_cold_us": g, "ksmm_g_warm_us": gw,
-                        "ksmm_no_graph_launch_us": g - c["graph_launch_us"], "ksmm_floor_us": floor,
-                        "cublas_g_cold_us": cg, "cublas_g_warm_us": cgw, "best_gpu_us": best,
-                        "best_gpu_impl": "ksmm" if best == g else "cublas",
-                        "ratio_e": e / v, "ratio_g_cold": g / v, "ratio_g_warm": gw / v,
-                        "ratio_no_graph_launch": (g - c["graph_launch_us"]) / v, "ratio_floor": floor / v,
-                        "ratio_cublas": cg / v, "ratio_best": best / v,
-                        "launch_share_of_e": (e - g) / e if e > g else 0.0,
-                        "graph_launch_share_of_g": c["graph_launch_us"] / g})
+            rows.append({"dataset": ds, "chain": name, "stages": k, "v41_us": v,
+                         "ksmm_e_p50_us": num(r.get("e_p50")), "ksmm_e_p80_us": num(r.get("e_p80")),
+                         "ksmm_h_us": num(r.get("h_us")), "ksmm_g_cold_us": g, "ksmm_g_warm_us": gw,
+                         "ksmm_no_graph_launch_us": g - c["graph_launch_us"],
+                         "ksmm_floor_no_graph_us": k * c["ksmm_1cta_us"],
+                         "cublas_g_cold_us": cg, "cublas_g_warm_us": cgw})
+    corr_cublas = {(r["dataset"], r["chain"]): r["g_cold_corrected_us"] for r in fb if r["impl"] == "cublas"}
+    short = [(x["stages"], x["ksmm_e_p50_us"] - x["ksmm_g_cold_us"]) for x in rows if x["ksmm_h_us"] < c["flush_us"]]
+    a, b = fit([k for k, _ in short], [d for _, d in short])
+    c["eager_dev_intercept_us"], c["eager_dev_per_stage_us"], c["eager_dev_fit_chains"] = a, b, len(short)
+    c["eager_dev_fit_stages"] = f"{min(k for k, _ in short)}-{max(k for k, _ in short)}"
+    for x in rows:
+        g, e, v = x["ksmm_g_cold_us"], x["ksmm_e_p50_us"], x["v41_us"]
+        host_hidden = x["ksmm_h_us"] < c["flush_us"]
+        dev = e - g if host_hidden else a + b * x["stages"]
+        best = min(z for z in (g, x["cublas_g_cold_us"]) if not math.isnan(z))
+        corr = corr_cublas.get((x["dataset"], x["chain"]), float("nan"))
+        best_corr = min(g, corr) if not math.isnan(corr) else best
+        x.update({
+            "host_hidden_by_flush": "是" if host_hidden else "否",
+            "eager_device_extra_us": dev, "host_in_e_us": (e - g) - dev,
+            "best_gpu_us": best, "best_gpu_impl": "ksmm" if best == g else "cublas",
+            "ratio_e": e / v, "ratio_e_p80": x["ksmm_e_p80_us"] / v, "ratio_g_cold": g / v,
+            "ratio_g_warm": x["ksmm_g_warm_us"] / v, "ratio_no_graph_launch": x["ksmm_no_graph_launch_us"] / v,
+            "ratio_floor_no_graph": x["ksmm_floor_no_graph_us"] / v,
+            "ratio_cublas": x["cublas_g_cold_us"] / v, "ratio_best": best / v,
+            "cublas_g_cold_corrected_us": corr, "ratio_cublas_corrected": corr / v,
+            "best_gpu_corrected_us": best_corr, "best_gpu_corrected_impl": "ksmm" if best_corr == g else "cublas",
+            "ratio_best_corrected": best_corr / v,
+            "host_share_of_e": ((e - g) - dev) / e, "eager_device_share_of_e": dev / e,
+            "graph_launch_share_of_g": c["graph_launch_us"] / g})
+    return rows
+
+
+# --------------------------------------------------------------------------- L2 flush bias
+
+
+def flush_bias(inp: Inputs) -> list[dict]:
+    """G_cold re-measured with T4's flush (zero_(): dirty lines left in L2) and a read-only flush (clean lines);
+    random operands, batch 1 (t8_probe.py flushcmp). Published G_cold from the a100-* runs.
+
+    Each flush kind is measured in several rounds; the first rounds on a freshly built multi-GB matrix are slow
+    whatever the flush (flushcmp-big.jsonl measures clean first), so each kind takes its fastest round.
+    flushcmp-big.jsonl (3 rounds, clean first) replaces flushcmp.jsonl (2 rounds, zero first) where both exist.
+    bias = zero / clean - 1 is what the dirty lines add; the corrected G_cold is published / (1 + bias).
+    """
+    recs = {}
+    for name in ("flushcmp.jsonl", "flushcmp-big.jsonl"):
+        f = inp.t8 / name
+        if f.exists():
+            for r in jsonl(f):
+                if r.get("kind") == "flushcmp":
+                    recs[(r["dataset"], r["chain"], r["impl"], r["batch"])] = dict(r, file=name)
+    out = []
+    for (ds, chain, impl, batch), r in recs.items():
+        pub = num(inp.results.get((ds, impl), {}).get(chain, {}).get("time_us"))
+        v41 = num(inp.v41.get((ds, chain), {}).get("cycles")) / 1000
+        zr, cr = r.get("zero_rounds", []), r.get("clean_rounds", [])
+        z, cl = (min(zr), min(cr)) if zr and cr else (float("nan"), float("nan"))
+        bias = z / cl - 1
+        corr = pub / (1 + bias)
+        out.append({"dataset": ds, "chain": chain, "impl": impl, "batch": batch, "m_in": r["m_in"], "n_out": r["n_out"],
+                    "matrix_mb": 2 * r["m_in"] * r["n_out"] / 1e6 if impl == "cublas" else "",
+                    "status": r["status"], "file": r["file"], "order": r.get("order", "zero,clean"),
+                    "zero_rounds_us": " ".join(f"{x:.2f}" for x in zr), "clean_rounds_us": " ".join(f"{x:.2f}" for x in cr),
+                    "g_cold_published_us": pub, "g_cold_zero_us": z, "g_cold_clean_us": cl,
+                    "bias_pct": 100 * bias, "published_vs_zero_pct": 100 * (pub / z - 1),
+                    "g_cold_corrected_us": corr, "v41_us": v41,
+                    "ratio_published": pub / v41, "ratio_corrected": corr / v41, "ratio_clean": cl / v41,
+                    "sm_mhz_end": r.get("sm_mhz_end", "")})
+    out.sort(key=lambda x: (x["impl"], DATASETS.index(x["dataset"]), x["m_in"] * x["n_out"], x["chain"]))
     return out
 
 
@@ -545,7 +632,7 @@ def charts(out: Path, scale1: bool) -> None:
     # 1. the map: chain x batch, colour = device regime, cross = launch bound (eager)
     vl(out / "gpu-map.vl.json", {
         "description": "瓶颈地图（GPU 一侧，G_cold 口径）：每格是一条链在一个 batch 下的判定。颜色 = 去掉主机发射后 GPU 被什么卡住；"
-                       "叉号 = eager 发射时主机发一次整条链的时间 h 大于 G_cold（发射受限）。行按 nnz 排序。数据：gpu-regimes.csv",
+                       "叉号 = 主机发一次整条链的时间 h_us 大于 G_cold（连续 eager 调用时发射受限）；白圈 = 有 ncu 的格子（其余格子是按规则推断的）。行按 nnz 排序。数据：gpu-regimes.csv",
         "data": {"url": "gpu-regimes.csv", "format": {"type": "csv", "parse": num_parse}},
         "transform": [{"filter": "datum.dataset != 'scale1' && datum.impl != 'cusparse'"},
                       {"calculate": "(datum.dataset == 'v1' ? 'v1/' : 'ref/') + datum.chain + ' (' + datum.stages + ' 级)'",
@@ -564,6 +651,11 @@ def charts(out: Path, scale1: bool) -> None:
                                       {"field": "fixed_share", "format": ".2f"}, {"field": "bw_share", "type": "quantitative",
                                                                                  "format": ".2f"},
                                       {"field": "tc_share", "type": "quantitative", "format": ".2f"}]}},
+            {"transform": [{"filter": "datum.ncu_source != null && datum.ncu_source != ''"}],
+             "mark": {"type": "point", "shape": "circle", "size": 70, "color": "white", "filled": False, "strokeWidth": 1.5},
+             "encoding": {"x": {"field": "batch", "type": "ordinal"},
+                          "y": {"field": "who", "type": "nominal", "sort": {"field": "nnz", "op": "max",
+                                                                          "order": "ascending"}}}},
             {"transform": [{"filter": "datum.eager_regime == '发射受限'"}],
              "mark": {"type": "point", "shape": "cross", "size": 30, "color": "black", "filled": True},
              "encoding": {"x": {"field": "batch", "type": "ordinal"},
@@ -641,7 +733,7 @@ def charts(out: Path, scale1: bool) -> None:
     # 4. scale axis: per-kernel time vs CTA count (floor probe)
     vl(out / "gpu-cta.vl.json", {
         "description": "规模轴：一个 KSMM kernel（batch 1）在 graph 里的时间随 CTA 数（= 每级的 A·D，N/2 或 N/4）的变化。"
-                       "点 = T8 探针 (a, r, r, 1) 级重复 8 次与 1 次之差 ÷ 7；虚线 = 一个 CTA 的 kernel（固定开销 + 一个 CTA 的访存延迟）；"
+                       "点 = T8 探针 (a, r, r, 1) 级重复 8 次与 1 次之差 ÷ 7；虚线 = 只有一个 CTA 的 KSMM kernel；"
                        "点线 = 空 kernel。数据：gpu-floor.csv",
         "data": {"url": "gpu-floor.csv", "format": {"type": "csv", "parse": {"ctas": "number", "per_kernel_us": "number"}}},
         "width": 380, "height": 260,
@@ -660,24 +752,24 @@ def charts(out: Path, scale1: bool) -> None:
                           "color": {"value": "black"}, "tooltip": [{"field": "label"}]}}]})
     # 5. per-chain split of G_cold (KSMM, batch 1) with V4.1 as a tick
     vl(out / "gpu-split.vl.json", {
-        "description": "KSMM 一条链的 G_cold（batch 1）拆成四段：graph 启动、每个 kernel 的空 kernel 下限、一个 CTA 的访存延迟、其余（CTA 数带来的部分）。"
+        "description": "KSMM 一条链的 G_cold（batch 1）拆成四段：graph 启动、每个 kernel 的空 kernel 下限、单 CTA kernel 比空 kernel 多出的时间、其余（CTA 数带来的部分）。"
                        "黑色竖线 = V4.1 的时间。数据：gpu-chain-split.csv",
         "data": {"url": "gpu-chain-split.csv", "format": {"type": "csv", "parse": {
-            "graph_launch_us": "number", "kernel_floor_us": "number", "latency_us": "number", "cta_us": "number",
+            "graph_launch_us": "number", "kernel_floor_us": "number", "onecta_extra_us": "number", "cta_us": "number",
             "v41_us": "number", "g_cold_us": "number"}}},
         "transform": [{"calculate": "(datum.dataset == 'v1' ? 'v1/' : 'ref/') + datum.chain", "as": "who"}],
         "height": {"step": 12}, "width": 420,
         "layer": [
-            {"transform": [{"fold": ["graph_launch_us", "kernel_floor_us", "latency_us", "cta_us"], "as": ["段", "us"]},
+            {"transform": [{"fold": ["graph_launch_us", "kernel_floor_us", "onecta_extra_us", "cta_us"], "as": ["段", "us"]},
                            {"calculate": "{'graph_launch_us': 'graph 启动', 'kernel_floor_us': '空 kernel 下限 × 级数', "
-                                         "'latency_us': '一个 CTA 的访存延迟 × 级数', 'cta_us': 'CTA 数带来的部分'}[datum['段']]",
+                                         "'onecta_extra_us': '单 CTA kernel 比空 kernel 多出的时间 × 级数', 'cta_us': 'CTA 数带来的部分'}[datum['段']]",
                             "as": "segment"}],
              "mark": "bar",
              "encoding": {"y": {"field": "who", "type": "nominal", "title": None,
                                 "sort": {"field": "g_cold_us", "op": "max", "order": "ascending"}},
                           "x": {"field": "us", "type": "quantitative", "title": "µs（G_cold）", "stack": "zero"},
                           "color": {"field": "segment", "type": "nominal", "title": None,
-                                    "sort": ["graph 启动", "空 kernel 下限 × 级数", "一个 CTA 的访存延迟 × 级数", "CTA 数带来的部分"]},
+                                    "sort": ["graph 启动", "空 kernel 下限 × 级数", "单 CTA kernel 比空 kernel 多出的时间 × 级数", "CTA 数带来的部分"]},
                           "tooltip": [{"field": "who"}, {"field": "segment"}, {"field": "us", "format": ".2f"}]}},
             {"mark": {"type": "tick", "color": "black", "thickness": 2},
              "encoding": {"y": {"field": "who", "type": "nominal", "sort": {"field": "g_cold_us", "op": "max", "order": "ascending"}},
@@ -713,13 +805,18 @@ def charts(out: Path, scale1: bool) -> None:
 def report(c, reg, chain_split, lr, xo, cfg, lim, inp) -> None:
     print("\n== floor constants (us)")
     for k, v in c.items():
-        print(f"  {k} = {v:.4f}")
+        print(f"  {k} = {v:.4f}" if isinstance(v, float) else f"  {k} = {v}")
     print("\n== regime counts (dataset, impl, regime)")
     cnt = defaultdict(int)
     for r in reg:
         cnt[(r["dataset"], r["impl"], r["device_regime"])] += 1
     for k, v in sorted(cnt.items()):
         print(f"  {k}: {v}")
+    print("\n== regime basis (ksmm points with byte estimate >= 30 %)")
+    for r in reg:
+        if r["regime_basis"] != "规则":
+            print(f"  {r['dataset'][:4]} {r['chain']:26s} b={r['batch']:<5} est={r['bw_share']:.3f} "
+                  f"dram={r['ncu_dram_pct']} sm={r['ncu_sm_pct']} -> {r['device_regime']} ({r['regime_basis']})")
     print("\n== ncu agreement")
     agree = defaultdict(int)
     for r in reg:
@@ -754,15 +851,18 @@ def report(c, reg, chain_split, lr, xo, cfg, lim, inp) -> None:
     print("\n== chain split (ksmm, batch 1)")
     for r in chain_split:
         print(f"  {r['dataset'][:4]} {r['chain']:30s} K={r['stages']:2d} G={r['g_cold_us']:7.2f} launch={r['share_launch']:.2f} "
-              f"floor={r['share_floor']:.2f} lat={r['share_latency']:.2f} cta={r['share_cta']:.2f} ratio={r['ratio']:6.1f} "
+              f"floor={r['share_floor']:.2f} onecta={r['share_onecta_extra']:.2f} cta={r['share_cta']:.2f} "
+              f"fixed_total={r['share_fixed_total']:.2f} ratio={r['ratio']:6.1f} "
               f"stageGPU={r['per_stage_gpu_us']:.2f} stageV41={r['per_stage_v41_us']:.3f}")
     print("\n== launch removed")
     for r in lr:
         if r["dataset"] == "v3-reference-data" or r["chain"] in ("butterfly_8192", "r2v_65536", "r2t_65536"):
             print(f"  {r['dataset'][:4]} {r['chain']:22s} E={r['ksmm_e_p50_us']:7.1f} Gc={r['ksmm_g_cold_us']:7.1f} "
-                  f"Gw={r['ksmm_g_warm_us']:7.1f} floor={r['ksmm_floor_us']:6.1f} cub={r['cublas_g_cold_us']:8.1f} "
-                  f"V41={r['v41_us']:.3f} | xE={r['ratio_e']:.0f} xG={r['ratio_g_cold']:.0f} xGw={r['ratio_g_warm']:.0f} "
-                  f"xfloor={r['ratio_floor']:.0f} xbest={r['ratio_best']:.0f}")
+                  f"Gw={r['ksmm_g_warm_us']:7.1f} floor0={r['ksmm_floor_no_graph_us']:6.1f} cub={r['cublas_g_cold_us']:8.1f} "
+                  f"V41={r['v41_us']:.3f} | dev={r['eager_device_extra_us']:6.1f} host={r['host_in_e_us']:6.1f} "
+                  f"hidden={r['host_hidden_by_flush']} | xE={r['ratio_e']:.1f} xE80={r['ratio_e_p80']:.1f} "
+                  f"xG={r['ratio_g_cold']:.1f} xGw={r['ratio_g_warm']:.1f} xG-L={r['ratio_no_graph_launch']:.1f} "
+                  f"xfloor0={r['ratio_floor_no_graph']:.1f} xcub={r['ratio_cublas']:.1f} xbest={r['ratio_best']:.1f}")
     print("\n== crossovers (ksmm)")
     for r in xo:
         if r["dataset"] == "v3-reference-data":
@@ -778,7 +878,37 @@ def report(c, reg, chain_split, lr, xo, cfg, lim, inp) -> None:
         print(f"  {r['run']:22s} {r['idx']} {r['kernel'][:28]:28s} {r['duration_us']:8.2f}us sm={r['sm_pct']:.1f} dram={r['dram_pct']:.1f} "
               f"issue={r['issue_active_pct']:.1f} occ={r['occ_achieved_pct']:.1f}/{r['occ_theoretical_pct']:.1f} "
               f"pipes[{r['pipe_top']}] stalls[{r['stall_top']}]")
+    best = ncu_summary(inp).get(("v3-reference-data-cfg256", "bfly_4", "ksmm", 4096))
+    if best:
+        print("\n== bfly_4 ksmm batch 4096, config 256/1/3, application replay (T4 metrics):",
+              {k: (round(v, 2) if isinstance(v, float) else v) for k, v in best.items()})
     print("\nscale1 published:", inp.scale1_published)
+
+
+def report_flush(fb: list[dict], lr: list[dict]) -> None:
+    print("\n== L2 flush bias (G_cold zero_() vs read-only flush, batch 1, fastest round of each)")
+    for impl in ("cublas", "ksmm"):
+        rows = [r for r in fb if r["impl"] == impl and r["status"] == "ok"]
+        if not rows:
+            continue
+        b = [r["bias_pct"] for r in rows]
+        print(f"  {impl}: n={len(rows)} bias {min(b):.1f}..{max(b):.1f}% median {statistics.median(b):.1f}%")
+        for r in rows:
+            mb = "" if r["matrix_mb"] == "" else f"{r['matrix_mb']:.1f}"
+            print(f"    {r['dataset'][:4]} {r['chain']:28s} {mb:>8} MB pub={r['g_cold_published_us']:9.2f} "
+                  f"zero={r['g_cold_zero_us']:9.2f} clean={r['g_cold_clean_us']:9.2f} bias={r['bias_pct']:6.1f}% "
+                  f"pub/zero={r['published_vs_zero_pct']:6.1f}% x_pub={r['ratio_published']:.2f} "
+                  f"x_corr={r['ratio_corrected']:.2f} [{r['zero_rounds_us']} | {r['clean_rounds_us']}] {r['file']}")
+    errs = [r for r in fb if r["status"] != "ok"]
+    print("  errors:", [(r["dataset"], r["chain"], r["impl"], r["status"]) for r in errs])
+    for ds in DATASETS:
+        rows = [r for r in lr if r["dataset"] == ds and not math.isnan(r["ratio_cublas_corrected"])]
+        if rows:
+            print(f"  {ds}: cublas/V41 median {statistics.median(r['ratio_cublas'] for r in rows):.2f} -> "
+                  f"{statistics.median(r['ratio_cublas_corrected'] for r in rows):.2f}; best/V41 median "
+                  f"{statistics.median(r['ratio_best'] for r in rows):.2f} -> "
+                  f"{statistics.median(r['ratio_best_corrected'] for r in rows):.2f}; best impl changes: "
+                  f"{[r['chain'] for r in rows if r['best_gpu_impl'] != r['best_gpu_corrected_impl']]}")
 
 
 def main() -> None:
@@ -794,7 +924,8 @@ def main() -> None:
     ncu = ncu_summary(inp)
     reg = regimes(inp, c, ncu)
     stage_rows, chain_split = stage_compare(inp, c)
-    lr = launch_removed(inp, c)
+    fb = flush_bias(inp)
+    lr = launch_removed(inp, c, fb)
     xo = crossovers(reg)
     cfg = configs(inp, reg)
     lim = limiter(inp)
@@ -809,8 +940,11 @@ def main() -> None:
     if lim:
         write_csv(out / "gpu-limiter.csv", lim)
     write_csv(out / "gpu-t8-clocks.csv", clocks(inp))
+    if fb:
+        write_csv(out / "gpu-flush-bias.csv", fb)
     charts(out, inp.scale1_published)
     report(c, reg, chain_split, lr, xo, cfg, lim, inp)
+    report_flush(fb, lr)
 
 
 if __name__ == "__main__":

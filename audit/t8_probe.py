@@ -13,6 +13,8 @@ Subcommands
             Each config is forced through a one-config autotuner around the same JIT
             function (`ks_fused_kernel.fn`); only BLOCK_SIZE_BATCH, num_warps, num_stages
             change. Outputs are compared with the default (T4-autotuned) output.
+  flushcmp  G_cold with T4's L2 flush (zero_() of a 256 MB buffer, leaving dirty lines in L2) against a
+            read-only flush (sum() over another 256 MB buffer, leaving clean lines); random operands.
   profile   ncu / nsys workload in the format of `a100_audit.py profile` (same NVTX tags),
             but with random weights and no fp32 composition, so 2^16-point chains and
             their dense matrices can be profiled quickly. Optional --force-config.
@@ -217,6 +219,60 @@ def cmd_configs(args) -> None:
             torch.cuda.empty_cache()
 
 
+# --------------------------------------------------------------------------- flushcmp
+
+
+def random_call(torch, ks_forward, chain, impl: str, batch: int):
+    """Random operands (timing does not depend on values) and the call of one implementation."""
+    if impl == "ksmm":
+        ks, x = random_ksmm(torch, chain.stages, batch, seed=base.chain_seed(chain.name))
+        return ksmm_call(ks_forward, chain.stages, ks, x)
+    if impl == "cublas":  # random dense N_out x M_in matrix: GEMV / GEMM time does not depend on values
+        gen = torch.Generator(device="cuda").manual_seed(base.chain_seed(chain.name))
+        w = (torch.rand((chain.n_out, chain.m_in), generator=gen, device="cuda", dtype=torch.float16) - 0.5)
+        x = (torch.rand((chain.m_in, batch), generator=gen, device="cuda", dtype=torch.float16) - 0.5)
+        return lambda: torch.mm(w, x)
+    raise ValueError(impl)
+
+
+def cmd_flushcmp(args) -> None:
+    """G_cold with T4's flush (zero_() a 256 MB buffer: L2 left with dirty lines) against a read-only flush
+    (sum() over another 256 MB buffer: L2 left with clean lines). Same graph, alternating, `--rounds` each."""
+    torch, _triton, ks_forward, clock, flush, out = setup(args, "flushcmp")
+    clean_buf = torch.ones(base.FLUSH_BYTES // 4, dtype=torch.int32, device="cuda")
+    every = {"zero": flush.zero_, "clean": lambda: clean_buf.sum()}
+    pres = {m: every[m] for m in args.order.split(",")}  # measured in this order in every round
+    for chain in base.select(base.read_chains(Path(args.chains)), args.only):
+        for impl in args.impls.split(","):
+            row = {"kind": "flushcmp", "tag": args.tag, "order": args.order, "dataset": args.dataset,
+                   "chain": chain.name, "impl": impl,
+                   "batch": args.batch, "m_in": chain.m_in, "n_out": chain.n_out, "stages": len(chain.stages)}
+            graph = call = None
+            try:
+                call = random_call(torch, ks_forward, chain, impl, args.batch)
+                call()
+                torch.cuda.synchronize()
+                graph, _ = base.capture_graph(torch, call)
+                samples = {m: [] for m in pres}
+                for _ in range(args.rounds):
+                    for mode, pre in pres.items():
+                        samples[mode].append(base.summary(base.bench_graph(torch, graph, pre))["mean"])
+                for mode, v in samples.items():
+                    row[f"{mode}_us"] = sum(v) / len(v)
+                    row[f"{mode}_rounds"] = v
+                row["status"] = "ok"
+            except Exception as exc:
+                row.update(status=f"error:{type(exc).__name__}", error=str(exc)[:500])
+            finally:
+                del graph, call
+                torch.cuda.synchronize()
+                torch.cuda.empty_cache()
+            row["sm_mhz_end"], row["mem_mhz_end"] = clock.sm_mem()
+            base.write_jsonl(out, row)
+            print(f"{chain.name:28s} {impl:7s} zero={row.get('zero_us', float('nan')):9.2f} "
+                  f"clean={row.get('clean_us', float('nan')):9.2f} {row['status']}", flush=True)
+
+
 # --------------------------------------------------------------------------- profile
 
 
@@ -230,16 +286,7 @@ def cmd_profile(args) -> None:
     flush = torch.empty(base.FLUSH_BYTES // 4, dtype=torch.int32, device="cuda")
     for chain in base.select(base.read_chains(Path(args.chains)), args.only):
         for impl in args.impls.split(","):
-            if impl == "ksmm":
-                ks, x = random_ksmm(torch, chain.stages, args.batch, seed=base.chain_seed(chain.name))
-                call = ksmm_call(ks_forward, chain.stages, ks, x)
-            elif impl == "cublas":  # random dense N_out x M_in matrix: GEMV / GEMM time does not depend on values
-                gen = torch.Generator(device="cuda").manual_seed(base.chain_seed(chain.name))
-                w = (torch.rand((chain.n_out, chain.m_in), generator=gen, device="cuda", dtype=torch.float16) - 0.5)
-                x = (torch.rand((chain.m_in, args.batch), generator=gen, device="cuda", dtype=torch.float16) - 0.5)
-                call = (lambda w=w, x=x: torch.mm(w, x))
-            else:
-                raise ValueError(impl)
+            call = random_call(torch, ks_forward, chain, impl, args.batch)
             call()
             torch.cuda.synchronize()
             graph, _ = base.capture_graph(torch, call)
@@ -276,6 +323,18 @@ def main() -> None:
     c.add_argument("--extended-autotune", action="store_true",
                    help="also let the autotuner pick per stage from the whole space of the batch")
     c.set_defaults(fn=cmd_configs)
+
+    fc = sub.add_parser("flushcmp", help="G_cold with T4's zero_() flush vs a read-only flush")
+    fc.add_argument("--out", required=True)
+    fc.add_argument("--chains", required=True)
+    fc.add_argument("--dataset", required=True)
+    fc.add_argument("--only")
+    fc.add_argument("--impls", default="cublas")
+    fc.add_argument("--batch", type=int, default=1)
+    fc.add_argument("--rounds", type=int, default=2)
+    fc.add_argument("--order", default="zero,clean", help="flush kinds in measuring order within a round")
+    fc.add_argument("--tag", default="", help="free text stored with every row (e.g. a repeat)")
+    fc.set_defaults(fn=cmd_flushcmp)
 
     r = sub.add_parser("profile", help="ncu / nsys workload without fp32 composition")
     r.add_argument("--chains", required=True)
