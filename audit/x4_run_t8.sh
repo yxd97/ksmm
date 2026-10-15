@@ -61,12 +61,12 @@ for step in $steps; do
     cfg-stage)
       for spec in "64,2,2,32 1,256,4096" "2048,2,2,16 1" "16,4,4,64 1,4096" "256,8,9,1 1,4096"; do
         set -- $spec
-        "$RUN" "$gpu" "$O/clk-cfg-stage.csv" "v41-audit T8 KSMM configs on stage $1 (batch $2)" \
+        "$RUN" "$gpu" "$O/clk-cfg-stage-${1//,/x}.csv" "v41-audit T8 KSMM configs on stage $1 (batch $2)" \
           "$PY" "$P" configs --stage "$1" --batches "$2" --out "$O/cfg-stage.jsonl"
       done
       ;;
     cfg-chain)
-      "$RUN" "$gpu" "$O/clk-cfg-chain-ref.csv" "v41-audit T8 KSMM extended autotune, bfly_4 b1/256/4096, debut_5 b1/4096" \
+      "$RUN" "$gpu" "$O/clk-cfg-chain-ref.csv" "v41-audit T8 KSMM extended autotune, bfly_4 b1/256/4096" \
         "$PY" "$P" configs --chains "$D/v3-reference-data/chains.csv" --only bfly_4 --batches 1,256,4096 \
         --configs 256/1/3 --extended-autotune --out "$O/cfg-chain.jsonl"
       "$RUN" "$gpu" "$O/clk-cfg-chain-ref2.csv" "v41-audit T8 KSMM extended autotune, debut_5 b1/4096" \
