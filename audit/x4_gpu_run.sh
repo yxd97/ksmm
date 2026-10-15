@@ -3,7 +3,8 @@
 #   - refuse when another process is on that GPU;
 #   - log Start / End lines in /scratch/users/gpu-use-log/yd383.log;
 #   - sample SM / memory clocks with nvidia-smi every 200 ms while the command runs;
-#   - redirect triton / XDG / tmp caches under the audit work directory.
+#   - redirect triton / XDG / tmp caches under the audit work directory (a TRITON_CACHE_DIR set by the
+#     caller is kept).
 #
 # Usage: x4_gpu_run.sh <physical GPU index> <clock log path> "<log description>" <command...>
 set -uo pipefail
@@ -12,7 +13,7 @@ shift 3
 
 A=/scratch/users/phd/yd383/v41-audit
 LOG=/scratch/users/gpu-use-log/yd383.log
-export TRITON_CACHE_DIR=$A/.triton XDG_CACHE_HOME=$A/.cache TMPDIR=$A/tmp
+export TRITON_CACHE_DIR=${TRITON_CACHE_DIR:-$A/.triton} XDG_CACHE_HOME=$A/.cache TMPDIR=$A/tmp
 export TRITON_CACHE_AUTOTUNING=1 PYTHONDONTWRITEBYTECODE=1
 export CUDA_VISIBLE_DEVICES=$gpu
 
