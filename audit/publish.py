@@ -90,7 +90,7 @@ def describe(impl: str, ds: str, commit: str, measured_at: str, ck_note: str) ->
         "`data/a100-batch-sweep.csv`、`a100-nsys.csv`、`a100-ncu.csv`、`a100-checkpoint.csv`、`a100-clocks.csv`。\n"
         + extra +
         f"\n复现（测量时 ksmm 在提交 `{measured_at[:8]}`；`commits` 里的 `{commit[:8]}` 在它之后只改了 nsys-parse 写 kernel 名的方式，"
-        "并加了发布脚本，测量代码没变）：\n\n"
+        "加了发布脚本和 host_cmp.py，测量代码没变）：\n\n"
         "```bash\n"
         "R=/scratch/users/phd/yd383/kroissant-project; A=/scratch/users/phd/yd383/v41-audit; X=zhang-x4.ece.cornell.edu\n"
         "rsync -a $R/ksmm/ $X:$A/ksmm/                                   # ksmm 的 audit 分支\n"
