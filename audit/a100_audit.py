@@ -355,7 +355,7 @@ def git_state() -> dict:
         return subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True).stdout.strip()
 
     return {"ksmm_commit": run("git", "rev-parse", "HEAD"),
-            "ksmm_dirty": bool(run("git", "status", "--porcelain", "--untracked-files=no"))}
+            "ksmm_dirty": bool(run("git", "status", "--porcelain"))}  # untracked files count too
 
 
 def provenance(torch, triton, clock: Clock | None, flush_us: float) -> dict:
