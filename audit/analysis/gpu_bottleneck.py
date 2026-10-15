@@ -411,6 +411,8 @@ def launch_removed(inp: Inputs, c: dict, fb: list[dict]) -> list[dict]:
                          "cublas_g_cold_us": cg, "cublas_g_warm_us": cgw})
     corr_cublas = {(r["dataset"], r["chain"]): r["g_cold_corrected_us"] for r in fb if r["impl"] == "cublas"}
     short = [(x["stages"], x["ksmm_e_p50_us"] - x["ksmm_g_cold_us"]) for x in rows if x["ksmm_h_us"] < c["flush_us"]]
+    c["eager_dev_fit_by_dataset"] = " ".join(
+        f"{ds}:{sum(1 for x in rows if x['dataset'] == ds and x['ksmm_h_us'] < c['flush_us'])}" for ds in DATASETS)
     a, b = fit([k for k, _ in short], [d for _, d in short])
     c["eager_dev_intercept_us"], c["eager_dev_per_stage_us"], c["eager_dev_fit_chains"] = a, b, len(short)
     c["eager_dev_fit_stages"] = f"{min(k for k, _ in short)}-{max(k for k, _ in short)}"
@@ -433,7 +435,9 @@ def launch_removed(inp: Inputs, c: dict, fb: list[dict]) -> list[dict]:
             "best_gpu_corrected_us": best_corr, "best_gpu_corrected_impl": "ksmm" if best_corr == g else "cublas",
             "ratio_best_corrected": best_corr / v,
             "host_share_of_e": ((e - g) - dev) / e, "eager_device_share_of_e": dev / e,
-            "graph_launch_share_of_g": c["graph_launch_us"] / g})
+            "graph_launch_share_of_g": c["graph_launch_us"] / g,
+            "note": "外推的设备端部分大于 E − G_cold：拟合误差，主机发射按 0 看待"
+                    if (e - g) - dev < 0 else ""})
     return rows
 
 
@@ -472,7 +476,11 @@ def flush_bias(inp: Inputs) -> list[dict]:
                     "bias_pct": 100 * bias, "published_vs_zero_pct": 100 * (pub / z - 1),
                     "g_cold_corrected_us": corr, "v41_us": v41,
                     "ratio_published": pub / v41, "ratio_corrected": corr / v41, "ratio_clean": cl / v41,
-                    "sm_mhz_end": r.get("sm_mhz_end", "")})
+                    "sm_mhz_end": r.get("sm_mhz_end", ""),
+                    # a published value well above the steady zero-flush value carries the slow first replays of a
+                    # freshly built multi-GB matrix; g_cold_corrected_us only removes the flush bias
+                    "note": "发布值含刚建大矩阵的慢回放，g_cold_corrected_us 只扣清 L2 偏差；稳态值看 g_cold_clean_us"
+                            if pub / z - 1 > 0.10 else ""})
     out.sort(key=lambda x: (x["impl"], DATASETS.index(x["dataset"]), x["m_in"] * x["n_out"], x["chain"]))
     return out
 
@@ -826,6 +834,11 @@ def report(c, reg, chain_split, lr, xo, cfg, lim, inp) -> None:
                 print("  disagree:", r["dataset"], r["chain"], r["impl"], r["batch"], r["device_regime"],
                       r["ncu_dram_pct"], r["ncu_sm_pct"], r["ncu_tensor_pct"])
     print(" ", dict(agree))
+    judged_by_ncu = sum(1 for r in reg if r["ncu_agrees"] == "一致" and r["regime_basis"] != "规则")
+    old_sm_fail = [(r["chain"], r["batch"]) for r in reg if r["ncu_agrees"] and r["device_regime"] == R_SM
+                   and not (r["ncu_dram_pct"] < 30 and r["ncu_sm_pct"] >= 30)]
+    print(f"  of the agreeing points: judged by ncu itself {judged_by_ncu}, rule first then ncu check "
+          f"{agree['一致'] - judged_by_ncu}; CTA points failing round-1 condition (DRAM<30 and SM>=30): {old_sm_fail}")
     print("\n== launch bound (eager), batch 1")
     for impl in IMPLS:
         b1 = [r for r in reg if r["impl"] == impl and r["batch"] == 1]
