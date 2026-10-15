@@ -89,7 +89,8 @@ def describe(impl: str, ds: str, commit: str, measured_at: str, ck_note: str) ->
         "- 口径、时钟、软件版本见 `config`；batch 扫描、nsys 汇总、ncu 明细、检查点、时钟采样在任务目录的 "
         "`data/a100-batch-sweep.csv`、`a100-nsys.csv`、`a100-ncu.csv`、`a100-checkpoint.csv`、`a100-clocks.csv`。\n"
         + extra +
-        f"\n复现（测量时 ksmm 在提交 `{measured_at[:8]}`，`commits` 里的 `{commit[:8]}` 只多了发布脚本，harness 文件相同）：\n\n"
+        f"\n复现（测量时 ksmm 在提交 `{measured_at[:8]}`；`commits` 里的 `{commit[:8]}` 在它之后只改了 nsys-parse 写 kernel 名的方式，"
+        "并加了发布脚本，测量代码没变）：\n\n"
         "```bash\n"
         "R=/scratch/users/phd/yd383/kroissant-project; A=/scratch/users/phd/yd383/v41-audit; X=zhang-x4.ece.cornell.edu\n"
         "rsync -a $R/ksmm/ $X:$A/ksmm/                                   # ksmm 的 audit 分支\n"
@@ -309,6 +310,14 @@ def main() -> None:
                 cols.pop("csr_nnz")
             prov = provenance[ds][-1]
             clk = clocks.get(f"clk-measure-{ds}.csv", {})
+            pts = list(latest.values())
+            low = [x for x in pts if x["sm_mhz_end"] < 1410]
+            low_note = (f"每个点测完时用 NVML 读一次 SM 时钟：{len(pts)} 个点里 {len(low)} 个低于 1410 MHz"
+                        + (f"（{min(x['sm_mhz_end'] for x in low)}–{max(x['sm_mhz_end'] for x in low)} MHz，batch 都 ≥ "
+                           f"{min(x['batch'] for x in low)}，其中 {sum(1 for x in low if x['impl'] == 'cublas')} 个是 cublas）"
+                           if low else "")
+                        + f"；batch = 1 的点 {sum(1 for x in low if x['batch'] == 1)} 个低于 1410。"
+                        "降频原因位 0x4 是软件功耗上限（SW power cap）")
             run = {
                 "format": "dataset-run/1",
                 "title": TITLES[impl],
@@ -328,7 +337,7 @@ def main() -> None:
                                f"显存 {prov['mem_clock_mhz_applications']} MHz）。测量期间 nvidia-smi 每 200 ms 采样，GPU 忙的 "
                                f"{clk.get('busy_samples')} 个样本：SM {clk.get('sm_mhz_min')}–{clk.get('sm_mhz_max')} MHz（中位数 "
                                f"{clk.get('sm_mhz_median')}，{100 * clk.get('share_at_1410', 0):.1f}% 的样本在 1410），显存 {clk.get('mem_mhz')} MHz，"
-                               f"降频原因位 {clk.get('throttle_reasons')}，最高 {clk.get('temp_c_max')} °C、{clk.get('power_w_max')} W"),
+                               f"降频原因位 {clk.get('throttle_reasons')}，最高 {clk.get('temp_c_max')} °C、{clk.get('power_w_max')} W。{low_note}"),
                     "dtype": "fp16 输入、权重、输出；乘加在 fp32 里累加（KSMM 的 tl.dot、cuBLAS 的 CUBLAS_COMPUTE_32F、cuSPARSE 的 CUDA_R_32F）",
                     "batch": 1,
                     "layout": "特征维在前：输入 X 是 (M_in, batch)，输出 Y 是 (N_out, batch)；第 0 级最先作用在输入上",
