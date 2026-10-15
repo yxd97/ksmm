@@ -1,10 +1,13 @@
 """Turn the zhang-x4 outputs of x4_run_all.sh into operations dataset runs and task data files.
 
 Standard library only (runs on zhang-22). Inputs, all in --in (a copy of the x4 output dir):
-  checkpoint.jsonl, measure-<dataset>.jsonl, nsys-<dataset>.csv, ncu-kernels.csv, clk-*.csv
+  checkpoint.jsonl, measure-<dataset>.jsonl, nsys-<dataset>.csv, ncu-kernels.csv, clk-*.csv,
+  host-cmp.csv (from host_cmp.py)
+Also reads the V4.1 and V3 runs of each dataset (runs/v41 `padded`, runs/v3-eb02 `shape_run`) to
+state where their zero-padded shapes differ from the original dimensions A100 runs.
 Outputs:
   <ops>/datasets/<dataset>/runs/a100-<impl>/{run.json,results.csv}   (batch 1)
-  <ops>/tasks/<task>/data/a100-{checkpoint,batch-sweep,nsys,ncu,clocks}.csv
+  <ops>/tasks/<task>/data/a100-{checkpoint,batch-sweep,nsys,ncu,clocks,host-cmp}.csv
 """
 from __future__ import annotations
 
@@ -26,10 +29,10 @@ TITLES = {
 TIMING = {
     "time_us": "G_cold 的均值（µs）",
     "E": "eager：triton.testing.do_bench(call, warmup=25, rep=100)（与旧 harness 相同），对全部样本算 p20/p50/p80（公式与 triton 3.6 的 _quantile 相同）。do_bench 每次调用前把 256 MB 缓冲清零来清 L2，清零在计时窗口外；但主机在清零执行期间（约 150 µs）已经开始逐级发射，所以 E 含主机发射时间里没被清零盖住的部分",
-    "G_cold": "整条链录成一个 CUDA graph；每次回放前把同一个 256 MB 缓冲清零（窗口外），窗口里只有 graph.replay()。清零执行时主机已经提交了回放，所以窗口里没有主机发射时间。预热 25 ms，测约 100 ms（样本数见 task data 的 gc_n）",
+    "G_cold": "整条链录成一个 CUDA graph；每次回放前把同一个 256 MB 缓冲清零（窗口外），窗口里只有 graph.replay()。清零执行时主机已经提交了回放，所以窗口里没有主机发射时间。预热 25 ms，测约 100 ms（样本数见 task data 的 gc_n）。窗口里含 graph 在设备端的启动延迟：nsys 量到清零 kernel 结束到链的第一个 kernel 开始是 1.95–3.94 µs（eager 约 1.0 µs；G1 第 2 轮 partC 审阅第 4 节）。所以小链的 G_cold 里有 2–4 µs 不是 kernel 时间（对比 time_us 和 d_span_us），分析时把它算作 GPU 的固定开销",
     "G_warm": "同一个 graph；每次回放前先跑一个不访存的空转 kernel（torch.cuda._sleep(100000)，约 70 µs）让 GPU 保持忙，L2 里还是上一次回放的数据",
     "D": "nsys 2024.5.1（--trace=cuda,nvtx --cuda-graph-trace=node）：在 G_cold 的条件下回放 20 次，每次把这次回放启动的 kernel 的设备时间相加，取中位数。kernel 按启动它的 API 调用（cudaGraphLaunch、cuLaunchKernelEx 等，correlationId 相同）是否落在这次回放的 NVTX 区间里归属",
-    "E_minus_G": "E − G_cold 是主机发射开销里露在外面的部分：同样清 L2，差别只在 kernel 由主机逐个发射还是由 graph 一次提交",
+    "E_minus_G": "E − G_cold 近似主机发射时间里露在外面的部分：同样清 L2，差别在 kernel 由主机逐个发射还是由 graph 一次提交。两点限定：(1) G_cold 窗口含 graph 在设备端的启动延迟（约 2–4 µs，见 G_cold），eager 的第一个 kernel 在清零后约 1 µs 就开始；(2) 单次调用、主机发射被清零盖住的情况（cuBLAS、cuSPARSE、短链 KSMM），E − G_cold 接近 0，可以为负。E 还随进程变，见 E",
     "h": "主机发一次整条链的时间：GPU 被约 70 ms 的空转 kernel 占着，主机连发 20 次、不等 GPU，取平均（µs）",
     "event_resolution": "这块 A100 上 CUDA event 计时以 1.024 µs 为步长：所有分位数都是 1.024 µs 的整数倍（结果表里 sheet-a100 的 10 个数也是）。所以 G_cold、G_warm 报均值，分位数另报",
 }
@@ -60,6 +63,7 @@ COLUMNS = {
     "d_eager_us": "nsys，E 条件（eager 发射、清 L2）：各 kernel 设备时间之和（µs），中位数",
     "h_us": "主机发一次整条链的时间（µs），不等 GPU",
     "rel_l2": "eager 输出对 fp32 稠密参考的相对 L2 误差；≤ 1e-2 记通过（graph 输出另核，见 task data）",
+    "nnz_ratio_padded": "V4.1 补零后的 nnz ÷ 原始 nnz（按运行 v41 的 padded 列算）；1 表示没补零。A100 跑原始维度，大于 1 的链上 V4.1 做的乘加是 A100 的这么多倍，见 config.shape",
     "csr_nnz": "合成矩阵转 CSR 后的非零数",
     "ncu_dram_pct": "ncu：DRAM 吞吐占峰值（%，dram__throughput.avg.pct_of_peak_sustained_elapsed），各 kernel 按时长加权；空着表示这条链没跑 ncu",
     "ncu_l2_hit_pct": "ncu：L2 命中率（%）= 各 kernel 的 lts__t_sectors_lookup_hit 之和 ÷（hit + miss 之和）",
@@ -69,6 +73,33 @@ COLUMNS = {
     "ncu_waves": "ncu：各 kernel waves（launch__waves_per_multiprocessor）的最大值",
     "note": "出错时的报错",
 }
+API_LOG_CMD = (
+    "A=/scratch/users/phd/yd383/v41-audit; K=<ksmm audit 分支的检出>; O=$A/runs/t4-fix; PY=/scratch/users/phd/yd383/venv-cu126/bin/python; "
+    "for b in 1 4; do CUBLAS_LOGINFO_DBG=1 CUBLAS_LOGDEST_DBG=$O/cublas-api-b$b.log CUSPARSE_LOG_LEVEL=5 "
+    "CUSPARSE_LOG_FILE=$O/cusparse-api-b$b.log $K/audit/x4_gpu_run.sh 0 $O/clk-apilog-b$b.csv apilog $PY $K/audit/a100_audit.py profile "
+    "--chains $A/datasets/v3-reference-data/chains.csv --dataset v3-reference-data --only debut_1,bfly_4 --impls cublas,cusparse "
+    "--batch $b --modes E --reps 1; done; "
+    "grep -A20 'cublasGemmEx(' $O/cublas-api-b1.log | grep -E '^i!  (transa|transb|m|n|k|Atype|Btype|Ctype|computeType|algo):' | sort | uniq -c; "
+    "grep -o '\\[Api\\]\\[cusparseSp[A-Za-z_]*\\]' $O/cusparse-api-b1.log | sort | uniq -c"
+)
+API_LOG = {
+    "cublas": ("cuBLAS API 日志（CUBLAS_LOGINFO_DBG=1，2026-10-15 01:58 EDT，ksmm 38a7fd2，debut_1 和 bfly_4，batch 1 和 4）："
+               "torch.mm 每次调用一次 cublasGemmEx，每个 batch 12 次，参数全部是 transa = transb = CUBLAS_OP_N、m = batch、"
+               "n = N_out、k = M_in（debut_1 是 16，bfly_4 是 4096）、Atype = Btype = Ctype = CUDA_R_16F、"
+               "computeType = CUBLAS_COMPUTE_32F、algo = CUBLAS_GEMM_DEFAULT_TENSOR_OP。日志头写的是「cuBLAS (v12.3)」，"
+               "但进程实际载入的是 venv 里的 libcublas.so.12，cublasGetProperty 读出 12.6.4（G1 第 2 轮 partC 审阅第 7 节），"
+               "与 pip 包 nvidia-cublas-cu12 12.6.4.1 一致。日志在 zhang-x4 的 /scratch/users/phd/yd383/v41-audit/runs/t4-fix/"),
+    "cusparse": ("cuSPARSE API 日志（CUSPARSE_LOG_LEVEL=5，2026-10-15 01:58 EDT，ksmm 38a7fd2，debut_1 和 bfly_4）：batch 1 时 torch.mv "
+                 "每次调用 cusparseSpMV_bufferSize 和 cusparseSpMV 各一次（各 12 次），参数是 format = CSR、offsetType = columnType = 32I、"
+                 "valuesType = CUDA_R_16F、computeType = CUDA_R_32F、alg = SPMV_CSR_ALG1，trace 里的 kernel 是 csrmv_v3_partition_kernel、"
+                 "vector_scalar_multiply_kernel、csrmv_v3_kernel；batch 4 时 torch.mm 走 cusparseSpMM（alg = CSR_ALG2，kernel "
+                 "csrmm_alg2_partition_kernel、matrix_scalar_multiply_kernel、csrmm_alg2_kernel）。cusparseGetProperty 读出 12.5.4"
+                 "（G1 第 2 轮 partC 审阅第 7 节），与 pip 包 nvidia-cusparse-cu12 12.5.4.2 一致。日志在 zhang-x4 的 "
+                 "/scratch/users/phd/yd383/v41-audit/runs/t4-fix/"),
+}
+HOST_CMP_CMD = ("A=/scratch/users/phd/yd383/v41-audit; K=<ksmm audit 分支的检出>; O=$A/runs/t4-fix; "
+                "PY=/scratch/users/phd/yd383/venv-cu126/bin/python; for r in 0 1 2; do $K/audit/x4_gpu_run.sh 0 "
+                "$O/clk-host-cmp-$r.csv host_cmp $PY $K/audit/host_cmp.py --out $O/host-cmp.csv --run $r; done")
 NCU_CONFIG = ("ncu 2024.3.2（/usr/local/cuda-12.6/bin/ncu）：--replay-mode application --cache-control none --clock-control none "
               "--nvtx --nvtx-include prof/；每一遍重跑整个进程，harness 在 graph 回放前清 L2，所以每个 kernel 看到的缓存状态和 G_cold 相同；"
               "不锁频。只测部分链：v3-reference-data 的 debut_1、debut_2、debut_5、bfly_1、bfly_4，v1 的 debut_lenet_fc1_128x400、"
@@ -76,7 +107,7 @@ NCU_CONFIG = ("ncu 2024.3.2（/usr/local/cuda-12.6/bin/ncu）：--replay-mode ap
               "（ksmm、cublas）")
 
 
-def describe(impl: str, ds: str, commit: str, measured_at: str, ck_note: str) -> str:
+def describe(impl: str, ds: str, commit: str, measured_at: str, ck_note: str, shape_note: str) -> str:
     extra = {
         "ksmm": f"- **检查点**（只对 v3-reference-data）：{ck_note}\n",
         "cublas": "",
@@ -85,12 +116,14 @@ def describe(impl: str, ds: str, commit: str, measured_at: str, ck_note: str) ->
     return (
         f"zhang-x4 上实测（任务 2026-10-14-v41-baseline-audit，步骤 T4）。实现：{IMPL_CONFIG[impl]}。\n\n"
         "- **`time_us` 是 G_cold**（CUDA graph 回放、窗口外清 L2、不含主机发射），是和 V3、V4.1 比对用的数。\n"
-        "- E 和结果表 sheet-a100 是同一个口径。E − G_cold 是主机发射开销里露在外面的部分，h_us 是主机发一次整条链的总时间。\n"
+        "- E 和结果表 sheet-a100 是同一个口径。E − G_cold 近似露在外面的主机发射时间（限定见 `config.timing.E_minus_G`），"
+        "h_us 是主机发一次整条链的总时间。E 受主机速度影响，跨进程会差到约 20%，看主机开销用 h_us（见 `config.timing.E`）。\n"
+        f"- **形状**：{shape_note}\n"
         "- 口径、时钟、软件版本见 `config`；batch 扫描、nsys 汇总、ncu 明细、检查点、时钟采样在任务目录的 "
         "`data/a100-batch-sweep.csv`、`a100-nsys.csv`、`a100-ncu.csv`、`a100-checkpoint.csv`、`a100-clocks.csv`。\n"
         + extra +
-        f"\n复现（测量时 ksmm 在提交 `{measured_at[:8]}`；`commits` 里的 `{commit[:8]}` 在它之后只改了 nsys-parse 写 kernel 名的方式，"
-        "加了发布脚本和 host_cmp.py，测量代码没变）：\n\n"
+        f"\n复现（测量时 ksmm 在提交 `{measured_at[:8]}`；`commits` 里的 `{commit[:8]}` 在它之后只改了 nsys-parse 写 kernel 名的方式、"
+        "判断工作区是否干净时也算未跟踪文件，加了发布脚本和 host_cmp.py，测量代码没变）：\n\n"
         "```bash\n"
         "R=/scratch/users/phd/yd383/kroissant-project; A=/scratch/users/phd/yd383/v41-audit; X=zhang-x4.ece.cornell.edu\n"
         "rsync -a $R/ksmm/ $X:$A/ksmm/                                   # ksmm 的 audit 分支\n"
@@ -100,6 +133,10 @@ def describe(impl: str, ds: str, commit: str, measured_at: str, ck_note: str) ->
         "rsync -a --exclude '*.nsys-rep' --exclude '*.sqlite' --exclude '*.ncu-rep' $X:$A/runs/t4/ $R/scratch/a100-t4/\n"
         "python3 $R/ksmm/audit/publish.py --in $R/scratch/a100-t4 --ops $R/operations --commit <ksmm 提交>\n"
         "```\n\n"
+        + (f"host_cmp（检查点说明里的主机时间差，输出拷成 `$R/scratch/a100-t4/host-cmp.csv` 再发布）：`{HOST_CMP_CMD}`。\n\n"
+           if impl == "ksmm" else "")
+        + (f"API 日志的生成命令：`{API_LOG_CMD}`。\n\n" if impl != "ksmm" else "")
+        + 
         "`x4_gpu_run.sh` 在占卡前检查有没有别人的进程，前后在 gpu-use-log 登记，运行期间用 nvidia-smi 每 200 ms 采样时钟。"
         "原始 nsys、ncu 报告留在 zhang-x4 的 `$A/runs/t4/`。"
     )
@@ -133,6 +170,81 @@ def write_csv(path: Path, rows: list[dict]) -> None:
 def chain_order(ops: Path, dataset: str) -> list[str]:
     with open(ops / "datasets" / dataset / "chains.csv", encoding="utf-8", newline="") as stream:
         return [row["chain"] for row in csv.DictReader(stream)]
+
+
+def chain_stages(ops: Path, dataset: str) -> dict:
+    out = {}
+    with open(ops / "datasets" / dataset / "chains.csv", encoding="utf-8", newline="") as stream:
+        for row in csv.DictReader(stream):
+            stages, k = [], 0
+            while row.get(f"A{k}"):
+                stages.append(tuple(int(row[f"{x}{k}"]) for x in "ABCD"))
+                k += 1
+            out[row["chain"]] = stages
+    return out
+
+
+def run_shapes(ops: Path, dataset: str, run: str, column: str) -> dict:
+    """Per-chain stage shapes from another run's column, e.g. '256,2,2,1;128,2,2,2'."""
+    with open(ops / "datasets" / dataset / "runs" / run / "results.csv", encoding="utf-8", newline="") as stream:
+        return {row["chain"]: [tuple(int(v) for v in s.split(",")) for s in row[column].split(";")]
+                for row in csv.DictReader(stream) if row.get(column)}
+
+
+def nnz(stages) -> int:
+    return sum(a * b * c * d for a, b, c, d in stages)
+
+
+def m_in(stages) -> int:
+    a, _b, c, d = stages[0]
+    return a * c * d
+
+
+def n_out(stages) -> int:
+    a, b, _c, d = stages[-1]
+    return a * b * d
+
+
+def pct(x: float) -> str:
+    """+7.1% / −12.7% / 0.0% (Unicode minus, no signed zero)."""
+    t = f"{x:+.1f}%"
+    return "0.0%" if t in ("+0.0%", "-0.0%") else t.replace("-", "−")
+
+
+def fmt_ratio(x: float):
+    return int(x) if x == int(x) else round(x, 4)
+
+
+def shape_info(ops: Path, dataset: str):
+    """nnz ratio (V4.1 padded / original) per chain, and the text for config.shape."""
+    orig = chain_stages(ops, dataset)
+    v41 = run_shapes(ops, dataset, "v41", "padded")
+    v3 = run_shapes(ops, dataset, "v3-eb02", "shape_run")
+    ratio = {c: nnz(v41[c]) / nnz(st) for c, st in orig.items()}
+    changed = [c for c in orig if v41[c] != orig[c]]
+    items = []
+    for c in changed:
+        o, pz = orig[c], v41[c]
+        item = f"{c} {fmt_ratio(ratio[c])} 倍（nnz {nnz(o)}→{nnz(pz)}，M_in {m_in(o)}→{m_in(pz)}"
+        if n_out(o) != n_out(pz):
+            item += f"，N_out {n_out(o)}→{n_out(pz)}"
+        items.append(item + "）")
+    text = ("A100 的三种实现都按 chains.csv 的原始维度算，不补零。V3（运行 v3-eb02 的 shape_run 列）和 V4.1（运行 v41 的 padded 列）"
+            f"跑的是补零后的形状。本数据集 {len(orig)} 条链里有 {len(changed)} 条补零后形状变了")
+    if changed:
+        text += (f"，V4.1 的 nnz 是原始的 {fmt_ratio(min(ratio[c] for c in changed))}–{fmt_ratio(max(ratio[c] for c in changed))} 倍，"
+                 "这些链上 A100 做的乘加比 V4.1 少：" + "；".join(items) + "。")
+        v3diff = [c for c in changed if c in v3 and v3[c] != v41[c]]
+        if v3diff:
+            b1 = all(any(b == 1 for _a, b, _c, _d in orig[c]) for c in v3diff)
+            text += (f"其中 {len(v3diff)} 条" + ("有 B = 1 的级，" if b1 else "") + "V3 的补法和 V4.1 不同，V3 的倍数是："
+                     + "；".join(f"{c} {fmt_ratio(nnz(v3[c]) / nnz(orig[c]))} 倍" for c in v3diff) + "。")
+    else:
+        text += "。"
+    text += "其余链三方形状相同。列 nnz_ratio_padded 按 V4.1 算"
+    short = (f"A100 跑原始维度，V3、V4.1 跑补零后的形状；本数据集有 {len(changed)} 条链两边工作量不同"
+             "（`nnz_ratio_padded` > 1），详见 `config.shape`。")
+    return ratio, text, short
 
 
 def clock_summary(path: Path) -> dict:
@@ -249,11 +361,41 @@ def main() -> None:
     write_csv(data / "a100-clocks.csv", clock_rows)
     clocks = {c["log"]: c for c in clock_rows}
     worst = max(ck_rows, key=lambda x: abs(x["legacy_dev_pct"]))
+    # ---- checkpoint note and the E caveat: E of host-bound chains moves with host speed
+    meas_ref = {x["chain"]: x for x in read_jsonl(inp / "measure-v3-reference-data.jsonl")
+                if x["kind"] == "point" and x["impl"] == "ksmm" and x["batch"] == 1}
+    leg_dev = [x["legacy_dev_pct"] for x in ck_rows]
     ours_dev = [x["ours_dev_pct"] for x in ck_rows]
-    ck_note = (f"用旧 harness 自己的调用、同样的 do_bench，跑 3 轮取 p80 的中位数，10 条和表的偏差都在 ±10% 以内"
-               f"（最大 {worst['chain']} {worst['legacy_dev_pct']:+.1f}%）。本 harness 的调用比表低 "
-               f"{-max(ours_dev):.1f}% 到 {-min(ours_dev):.1f}%：长链的 E 主要是露在外面的主机发射时间，而旧调用发一次整条链"
-               "的主机时间多 2.1–7.0 µs（debut_1、debut_5、bfly_1、bfly_4 实测，audit/host_cmp.py）。逐条见任务 data/a100-checkpoint.csv。")
+    meas_dev = [(meas_ref[x["chain"]]["e_p80"] / x["sheet_p80_us"] - 1) * 100 for x in ck_rows]
+    with open(inp / "host-cmp.csv", encoding="utf-8", newline="") as stream:
+        hc = list(csv.DictReader(stream))
+    write_csv(data / "a100-host-cmp.csv", hc)
+    hd = [float(x["h_diff_us"]) for x in hc]
+    ed = [float(x["e_p80_diff_us"]) for x in hc]
+    share = [float(x["h_diff_us"]) / float(x["e_p80_diff_us"]) * 100 for x in hc if float(x["e_p80_diff_us"]) > 0]
+    same_e = sorted({x["chain"] for x in hc if float(x["e_p80_diff_us"]) == 0})
+    ck_note = (f"用旧 harness 自己的调用、同样的 do_bench（3 轮取 p80 的中位数），10 条对表是 {pct(min(leg_dev))} 到 "
+               f"{pct(max(leg_dev))}，都在 ±10% 以内；审阅在另一个进程复跑 1 轮是 −8.1% 到 +7.1%（G1 第 2 轮 partC 审阅第 3 节）。"
+               f"本 harness 的调用对表的偏差随进程变：检查点那个进程 {pct(min(ours_dev))} 到 {pct(max(ours_dev))}，"
+               f"measure 进程（本运行的 e_p80）{pct(min(meas_dev))} 到 {pct(max(meas_dev))}，审阅复跑的检查点 −20.6% 到 0%；"
+               "变的原因是主机速度，见 `config.timing.E`。旧调用的 E 比本调用高：host_cmp.py 在 3 个进程里测得，旧调用发一次整条链的"
+               f"主机时间多 {min(hd):.1f}–{max(hd):.1f} µs（它在链首尾各多一次 transpose().contiguous()），同一进程里两种调用的 E p80 差 "
+               f"{min(ed):.1f}–{max(ed):.1f} µs（{'、'.join(same_e) or '没有链'} 两者相同）；E p80 差大于 0 的链上，主机时间差只解释了 E 差的 "
+               f"{min(share):.0f}–{max(share):.0f}%，其余原因没有查清。数据见任务 data/a100-host-cmp.csv、data/a100-checkpoint.csv。")
+    d5_hc = [x for x in hc if x["chain"] == "debut_5"]
+    d5_e = [float(x["e_p80_ours_us"]) for x in d5_hc]
+    d5_h = [float(x["h_ours_us"]) for x in d5_hc]
+    h_all = d5_h + [meas_ref["debut_5"]["h_us"], 175.8]
+    e_note = ("。h_us 大于清零时间（约 150 µs）的链，E 受主机发射限制，跟着主机速度一比一变，不同进程之间实测相差可到约 20%："
+              "本 harness 同一个 ksmm 调用的 debut_5 E p80，检查点进程 "
+              f"{next(x['ours_p80_median'] for x in ck_rows if x['chain'] == 'debut_5')} µs，measure 进程 "
+              f"{round(meas_ref['debut_5']['e_p80'], 2)} µs，host_cmp 的 3 个进程 {min(d5_e):.2f}–{max(d5_e):.2f} µs，审阅复测 52.22 µs"
+              "（G1 第 2 轮 partC 审阅第 2 节）。跨进程比较 E 或 E − G_cold 时要带上这个误差。看主机开销用 h_us：debut_5 的 h_us "
+              f"在这几次之间只差 {(max(h_all) - min(h_all)) / max(h_all) * 100:.1f}%（measure {round(meas_ref['debut_5']['h_us'], 1)} µs，"
+              f"host_cmp {min(d5_h):.1f}–{max(d5_h):.1f} µs，审阅复测 175.8 µs）。G_cold、G_warm 是设备时间，审阅复测 21 个点偏差在 "
+              "−3.9% 到 +1.7% 以内")
+    timing = dict(TIMING)
+    timing["E"] = TIMING["E"] + e_note
 
     # ---- measurements
     sweep_rows = []
@@ -266,6 +408,7 @@ def main() -> None:
             if x["kind"] == "point":
                 latest[(x["chain"], x["impl"], x["batch"])] = x
         order = chain_order(ops, ds)
+        ratio, shape_text, shape_short = shape_info(ops, ds)
         for chain in order:
             for impl in IMPLS:
                 for (c, i, b), x in sorted(latest.items(), key=lambda kv: kv[0][2]):
@@ -302,6 +445,7 @@ def main() -> None:
                     row["csr_nnz"] = x.get("csr_nnz", "")
                 row.update(ncu_sum.get((ds, chain, impl, 1), {k: "" for k in (
                     "ncu_dram_pct", "ncu_l2_hit_pct", "ncu_sm_pct", "ncu_occ_pct", "ncu_tensor_pct", "ncu_waves")}))
+                row["nnz_ratio_padded"] = fmt_ratio(ratio[chain])
                 row["note"] = x.get("error", "")
                 out.append(row)
             run_dir = ops / "datasets" / ds / "runs" / f"a100-{impl}"
@@ -342,16 +486,18 @@ def main() -> None:
                     "dtype": "fp16 输入、权重、输出；乘加在 fp32 里累加（KSMM 的 tl.dot、cuBLAS 的 CUBLAS_COMPUTE_32F、cuSPARSE 的 CUDA_R_32F）",
                     "batch": 1,
                     "layout": "特征维在前：输入 X 是 (M_in, batch)，输出 Y 是 (N_out, batch)；第 0 级最先作用在输入上",
-                    "timing": TIMING,
+                    "shape": shape_text,
+                    "timing": timing,
                     "flush": f"{prov['flush_bytes']} 字节的 int32 缓冲 zero_()，一次约 {round(prov['flush_us_median'], 1)} µs",
                     "numerics": NUMERICS,
                     "impl": IMPL_CONFIG[impl],
+                    **({"api_log": API_LOG[impl]} if impl in API_LOG else {}),
                     "ncu": NCU_CONFIG,
                     "measured_at_commit": prov["ksmm_commit"],
                     "measured_tree_dirty": prov["ksmm_dirty"],
                     "loadavg_start": prov["loadavg_start"],
                 },
-                "description": describe(impl, ds, args.commit, prov["ksmm_commit"], ck_note),
+                "description": describe(impl, ds, args.commit, prov["ksmm_commit"], ck_note, shape_short),
                 "columns": cols,
             }
             (run_dir / "run.json").write_text(json.dumps(run, ensure_ascii=False, indent=1) + "\n", encoding="utf-8")
