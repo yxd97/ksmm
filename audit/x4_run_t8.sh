@@ -2,7 +2,8 @@
 # The T8 (GPU bottleneck) supplementary measurements on zhang-x4, one GPU, in this order:
 #   floor        empty-kernel graphs, one-CTA KSMM graphs, CTA-count sweep (t8_probe.py floor)
 #   cfg-stage    KSMM Triton configs outside T4's autotune space on single stage shapes
-#   cfg-chain    whole chains: default (T4 autotune) vs autotune over the extended space
+#   cfg-chain    whole chains: default (T4 autotune), config 256/1/3 forced on every stage (best on single
+#                stages at batch 256 / 4096), autotune over the extended space
 #   ncu-scale    T4's ncu metrics on 2^14 / 2^16 scale1 chains, batch 1 (application replay, GC mode)
 #   ncu-batch    T4's ncu metrics on bfly_4 at batch 64 and 1024 (fills T4's 1 / 16 / 256 / 4096)
 #   ncu-limiter  ncu sections (pipes, warp stalls, scheduler) on a few kernels; kernel replay, L2 flushed
@@ -67,13 +68,13 @@ for step in $steps; do
     cfg-chain)
       "$RUN" "$gpu" "$O/clk-cfg-chain-ref.csv" "v41-audit T8 KSMM extended autotune, bfly_4 b1/256/4096, debut_5 b1/4096" \
         "$PY" "$P" configs --chains "$D/v3-reference-data/chains.csv" --only bfly_4 --batches 1,256,4096 \
-        --configs none --extended-autotune --out "$O/cfg-chain.jsonl"
+        --configs 256/1/3 --extended-autotune --out "$O/cfg-chain.jsonl"
       "$RUN" "$gpu" "$O/clk-cfg-chain-ref2.csv" "v41-audit T8 KSMM extended autotune, debut_5 b1/4096" \
         "$PY" "$P" configs --chains "$D/v3-reference-data/chains.csv" --only debut_5 --batches 1,4096 \
-        --configs none --extended-autotune --out "$O/cfg-chain.jsonl"
+        --configs 256/1/3 --extended-autotune --out "$O/cfg-chain.jsonl"
       "$RUN" "$gpu" "$O/clk-cfg-chain-scale.csv" "v41-audit T8 KSMM extended autotune, r2v_65536 b1" \
         "$PY" "$P" configs --chains "$D/scale1/chains.csv" --only r2v_65536 --batches 1 \
-        --configs none --extended-autotune --out "$O/cfg-chain.jsonl"
+        --configs 256/1/3 --extended-autotune --out "$O/cfg-chain.jsonl"
       ;;
     ncu-scale)
       ncu_metrics scale-b1 "scale1 2^14/2^16 chains, ksmm+cublas, batch 1" \
