@@ -409,7 +409,7 @@ def launch_removed(inp: Inputs, c: dict, fb: list[dict]) -> list[dict]:
                          "ksmm_no_graph_launch_us": g - c["graph_launch_us"],
                          "ksmm_floor_no_graph_us": k * c["ksmm_1cta_us"],
                          "cublas_g_cold_us": cg, "cublas_g_warm_us": cgw})
-    clean_cublas = {(r["dataset"], r["chain"]): r["g_cold_clean_us"] for r in fb if r["impl"] == "cublas"}
+    corr_cublas = {(r["dataset"], r["chain"]): r["g_cold_corrected_us"] for r in fb if r["impl"] == "cublas"}
     short = [(x["stages"], x["ksmm_e_p50_us"] - x["ksmm_g_cold_us"]) for x in rows if x["ksmm_h_us"] < c["flush_us"]]
     a, b = fit([k for k, _ in short], [d for _, d in short])
     c["eager_dev_intercept_us"], c["eager_dev_per_stage_us"], c["eager_dev_fit_chains"] = a, b, len(short)
@@ -419,9 +419,8 @@ def launch_removed(inp: Inputs, c: dict, fb: list[dict]) -> list[dict]:
         host_hidden = x["ksmm_h_us"] < c["flush_us"]
         dev = e - g if host_hidden else a + b * x["stages"]
         best = min(z for z in (g, x["cublas_g_cold_us"]) if not math.isnan(z))
-        clean = clean_cublas.get((x["dataset"], x["chain"]), float("nan"))
-        best_clean = min(z for z in (g, clean, x["cublas_g_cold_us"]) if not math.isnan(z)) if not math.isnan(clean) \
-            else best
+        corr = corr_cublas.get((x["dataset"], x["chain"]), float("nan"))
+        best_corr = min(g, corr) if not math.isnan(corr) else best
         x.update({
             "host_hidden_by_flush": "是" if host_hidden else "否",
             "eager_device_extra_us": dev, "host_in_e_us": (e - g) - dev,
@@ -430,8 +429,9 @@ def launch_removed(inp: Inputs, c: dict, fb: list[dict]) -> list[dict]:
             "ratio_g_warm": x["ksmm_g_warm_us"] / v, "ratio_no_graph_launch": x["ksmm_no_graph_launch_us"] / v,
             "ratio_floor_no_graph": x["ksmm_floor_no_graph_us"] / v,
             "ratio_cublas": x["cublas_g_cold_us"] / v, "ratio_best": best / v,
-            "cublas_g_cold_clean_us": clean, "ratio_cublas_clean": clean / v,
-            "best_gpu_clean_us": best_clean, "ratio_best_clean": best_clean / v,
+            "cublas_g_cold_corrected_us": corr, "ratio_cublas_corrected": corr / v,
+            "best_gpu_corrected_us": best_corr, "best_gpu_corrected_impl": "ksmm" if best_corr == g else "cublas",
+            "ratio_best_corrected": best_corr / v,
             "host_share_of_e": ((e - g) - dev) / e, "eager_device_share_of_e": dev / e,
             "graph_launch_share_of_g": c["graph_launch_us"] / g})
     return rows
@@ -442,27 +442,38 @@ def launch_removed(inp: Inputs, c: dict, fb: list[dict]) -> list[dict]:
 
 def flush_bias(inp: Inputs) -> list[dict]:
     """G_cold re-measured with T4's flush (zero_(): dirty lines left in L2) and a read-only flush (clean lines);
-    random operands, batch 1 (t8_probe.py flushcmp). Published G_cold from the a100-* runs."""
-    f = inp.t8 / "flushcmp.jsonl"
-    if not f.exists():
-        return []
+    random operands, batch 1 (t8_probe.py flushcmp). Published G_cold from the a100-* runs.
+
+    Each flush kind is measured in several rounds; the first rounds on a freshly built multi-GB matrix are slow
+    whatever the flush (flushcmp-big.jsonl measures clean first), so each kind takes its fastest round.
+    flushcmp-big.jsonl (3 rounds, clean first) replaces flushcmp.jsonl (2 rounds, zero first) where both exist.
+    bias = zero / clean - 1 is what the dirty lines add; the corrected G_cold is published / (1 + bias).
+    """
+    recs = {}
+    for name in ("flushcmp.jsonl", "flushcmp-big.jsonl"):
+        f = inp.t8 / name
+        if f.exists():
+            for r in jsonl(f):
+                if r.get("kind") == "flushcmp":
+                    recs[(r["dataset"], r["chain"], r["impl"], r["batch"])] = dict(r, file=name)
     out = []
-    for r in jsonl(f):
-        if r.get("kind") != "flushcmp":
-            continue
-        pub = num(inp.results.get((r["dataset"], r["impl"]), {}).get(r["chain"], {}).get("time_us"))
-        v41 = num(inp.v41.get((r["dataset"], r["chain"]), {}).get("cycles")) / 1000
-        z, cl = num(r.get("zero_us")), num(r.get("clean_us"))
-        out.append({"dataset": r["dataset"], "chain": r["chain"], "impl": r["impl"], "batch": r["batch"],
-                    "m_in": r["m_in"], "n_out": r["n_out"],
-                    "matrix_mb": 2 * r["m_in"] * r["n_out"] / 1e6 if r["impl"] == "cublas" else "",
-                    "status": r["status"], "g_cold_published_us": pub, "g_cold_zero_us": z, "g_cold_clean_us": cl,
-                    "zero_rounds_us": " ".join(f"{x:.2f}" for x in r.get("zero_rounds", [])),
-                    "clean_rounds_us": " ".join(f"{x:.2f}" for x in r.get("clean_rounds", [])),
-                    "bias_pct": 100 * (z / cl - 1), "clean_vs_published_pct": 100 * (cl / pub - 1),
-                    "zero_vs_published_pct": 100 * (z / pub - 1),
-                    "v41_us": v41, "ratio_published": pub / v41, "ratio_clean": cl / v41,
+    for (ds, chain, impl, batch), r in recs.items():
+        pub = num(inp.results.get((ds, impl), {}).get(chain, {}).get("time_us"))
+        v41 = num(inp.v41.get((ds, chain), {}).get("cycles")) / 1000
+        zr, cr = r.get("zero_rounds", []), r.get("clean_rounds", [])
+        z, cl = (min(zr), min(cr)) if zr and cr else (float("nan"), float("nan"))
+        bias = z / cl - 1
+        corr = pub / (1 + bias)
+        out.append({"dataset": ds, "chain": chain, "impl": impl, "batch": batch, "m_in": r["m_in"], "n_out": r["n_out"],
+                    "matrix_mb": 2 * r["m_in"] * r["n_out"] / 1e6 if impl == "cublas" else "",
+                    "status": r["status"], "file": r["file"], "order": r.get("order", "zero,clean"),
+                    "zero_rounds_us": " ".join(f"{x:.2f}" for x in zr), "clean_rounds_us": " ".join(f"{x:.2f}" for x in cr),
+                    "g_cold_published_us": pub, "g_cold_zero_us": z, "g_cold_clean_us": cl,
+                    "bias_pct": 100 * bias, "published_vs_zero_pct": 100 * (pub / z - 1),
+                    "g_cold_corrected_us": corr, "v41_us": v41,
+                    "ratio_published": pub / v41, "ratio_corrected": corr / v41, "ratio_clean": cl / v41,
                     "sm_mhz_end": r.get("sm_mhz_end", "")})
+    out.sort(key=lambda x: (x["impl"], DATASETS.index(x["dataset"]), x["m_in"] * x["n_out"], x["chain"]))
     return out
 
 
@@ -875,27 +886,29 @@ def report(c, reg, chain_split, lr, xo, cfg, lim, inp) -> None:
 
 
 def report_flush(fb: list[dict], lr: list[dict]) -> None:
-    print("\n== L2 flush bias (G_cold zero_() vs read-only flush, batch 1)")
+    print("\n== L2 flush bias (G_cold zero_() vs read-only flush, batch 1, fastest round of each)")
     for impl in ("cublas", "ksmm"):
         rows = [r for r in fb if r["impl"] == impl and r["status"] == "ok"]
         if not rows:
             continue
         b = [r["bias_pct"] for r in rows]
-        cp = [r["clean_vs_published_pct"] for r in rows]
-        print(f"  {impl}: n={len(rows)} bias(zero/clean-1) {min(b):.1f}..{max(b):.1f}% median {statistics.median(b):.1f}%;"
-              f" clean vs published {min(cp):.1f}..{max(cp):.1f}%")
-        for r in sorted(rows, key=lambda r: (r["dataset"], -r["bias_pct"]))[:200]:
-            print(f"    {r['dataset'][:4]} {r['chain']:28s} {r['matrix_mb'] if r['matrix_mb'] == '' else round(r['matrix_mb'], 1)!s:>8} MB "
-                  f"pub={r['g_cold_published_us']:9.2f} zero={r['g_cold_zero_us']:9.2f} clean={r['g_cold_clean_us']:9.2f} "
-                  f"bias={r['bias_pct']:6.1f}% x_pub={r['ratio_published']:.1f} x_clean={r['ratio_clean']:.1f}")
+        print(f"  {impl}: n={len(rows)} bias {min(b):.1f}..{max(b):.1f}% median {statistics.median(b):.1f}%")
+        for r in rows:
+            mb = "" if r["matrix_mb"] == "" else f"{r['matrix_mb']:.1f}"
+            print(f"    {r['dataset'][:4]} {r['chain']:28s} {mb:>8} MB pub={r['g_cold_published_us']:9.2f} "
+                  f"zero={r['g_cold_zero_us']:9.2f} clean={r['g_cold_clean_us']:9.2f} bias={r['bias_pct']:6.1f}% "
+                  f"pub/zero={r['published_vs_zero_pct']:6.1f}% x_pub={r['ratio_published']:.2f} "
+                  f"x_corr={r['ratio_corrected']:.2f} [{r['zero_rounds_us']} | {r['clean_rounds_us']}] {r['file']}")
     errs = [r for r in fb if r["status"] != "ok"]
     print("  errors:", [(r["dataset"], r["chain"], r["impl"], r["status"]) for r in errs])
     for ds in DATASETS:
-        rows = [r for r in lr if r["dataset"] == ds and not math.isnan(r["ratio_cublas_clean"])]
+        rows = [r for r in lr if r["dataset"] == ds and not math.isnan(r["ratio_cublas_corrected"])]
         if rows:
             print(f"  {ds}: cublas/V41 median {statistics.median(r['ratio_cublas'] for r in rows):.2f} -> "
-                  f"{statistics.median(r['ratio_cublas_clean'] for r in rows):.2f}; best/V41 median "
-                  f"{statistics.median(r['ratio_best'] for r in rows):.2f} -> {statistics.median(r['ratio_best_clean'] for r in rows):.2f}")
+                  f"{statistics.median(r['ratio_cublas_corrected'] for r in rows):.2f}; best/V41 median "
+                  f"{statistics.median(r['ratio_best'] for r in rows):.2f} -> "
+                  f"{statistics.median(r['ratio_best_corrected'] for r in rows):.2f}; best impl changes: "
+                  f"{[r['chain'] for r in rows if r['best_gpu_impl'] != r['best_gpu_corrected_impl']]}")
 
 
 def main() -> None:
