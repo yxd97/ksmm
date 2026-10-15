@@ -59,6 +59,11 @@ WARMUP_MS, REP_MS = 25, 100  # same as the old harness and triton's defaults
 FLUSH_BYTES = 256 * 1024 * 1024  # same size as triton do_bench's L2-clearing buffer
 SLEEP_CYCLES = 100_000  # about 70 us at 1410 MHz
 TOL_REL_L2 = 1e-2  # pass threshold on ||y - y_ref||_2 / ||y_ref||_2
+# Largest fp32 composed matrix built by multiplying the stage matrices (65536 x 65536,
+# the T4 and T7-phase-1 sizes). Larger chains (T7 phase 2, up to 2^20 points) get the
+# fp32 reference stage by stage and the cuBLAS fp16 matrix column block by column block.
+DENSE32_MAX_BYTES = 16 << 30
+BLOCK_BYTES = 1 << 30  # fp32 identity block per column block of the fp16 composition
 IMPLS = ("ksmm", "cublas", "cusparse")
 
 
@@ -156,8 +161,10 @@ class Built:
         # KSMM layout: K[a*D + d, c, b] = W[a, b, c, d]
         self.k_bmm = [w.permute(0, 3, 2, 1).reshape(a * d, c, b).contiguous()
                       for w, (a, b, c, d) in zip(self.w4, chain.stages)]
-        self.dense32 = self._compose(torch)
-        self._self_check(torch)
+        small = chain.n_out * chain.m_in * 4 <= DENSE32_MAX_BYTES
+        self.dense32 = self._compose(torch) if small else None
+        if small:
+            self._self_check(torch)
 
     def _stage_dense(self, torch, k: int):
         a, b, c, d = self.chain.stages[k]
@@ -173,6 +180,35 @@ class Built:
         for k in range(1, len(self.chain.stages)):
             total = self._stage_dense(torch, k) @ total
         return total  # (N_out, M_in) fp32
+
+    def reference(self, torch, x32):
+        """fp32 reference output: composed matrix times x, or stage by stage for large chains."""
+        return self.dense32 @ x32 if self.dense32 is not None else self.stagewise32(torch, x32)
+
+    def composed16(self, torch):
+        """fp16 N_out x M_in matrix of the whole chain.
+
+        Small chains: the fp32 composed matrix rounded. Large chains: column blocks of the
+        identity pushed through the stages in fp32 (stagewise32), each block rounded to fp16;
+        refuses when the fp16 matrix alone does not fit in free device memory.
+        """
+        if self.dense32 is not None:
+            return self.dense32.half()
+        n_out, m_in = self.chain.n_out, self.chain.m_in
+        free, _total = torch.cuda.mem_get_info()
+        need = n_out * m_in * 2
+        if need + 4 * BLOCK_BYTES > free:
+            raise RuntimeError(f"{self.chain.name}: composed fp16 matrix {need / 2**30:.1f} GiB "
+                               f"does not fit ({free / 2**30:.1f} GiB free)")
+        w16 = torch.empty((n_out, m_in), dtype=torch.float16, device="cuda")
+        step = max(1, BLOCK_BYTES // (4 * m_in))
+        for j0 in range(0, m_in, step):
+            j1 = min(m_in, j0 + step)
+            eye = torch.zeros((m_in, j1 - j0), dtype=torch.float32, device="cuda")
+            eye[torch.arange(j0, j1, device="cuda"), torch.arange(j1 - j0, device="cuda")] = 1.0
+            w16[:, j0:j1] = self.stagewise32(torch, eye).half()
+            del eye
+        return w16
 
     def stagewise32(self, torch, x32):
         """fp32 chain applied stage by stage with einsum on the 4-D definition."""
@@ -203,7 +239,7 @@ class Built:
                 return y
 
             return call, {}
-        w16 = self.dense32.half()
+        w16 = self.composed16(torch)
         if impl == "cublas":
             return (lambda: torch.mm(w16, x)), {}
         if impl == "cusparse":
@@ -470,7 +506,7 @@ def cmd_measure(args) -> None:
             graph = call = out = gout = None
             try:
                 x = make_input(torch, chain, batch)
-                ref = built.dense32 @ x.float()
+                ref = built.reference(torch, x.float())
                 call, extra = built.make_call(torch, ks_forward, impl, x)
                 row.update(extra)
                 out = call()
