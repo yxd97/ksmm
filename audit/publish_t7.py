@@ -185,8 +185,9 @@ def main() -> None:
                 "- E 和结果表 sheet-a100 是同一个口径。E − G_cold 是主机发射开销里露在外面的部分，h_us 是主机发一次整条链的总时间。\n"
                 "- 只测 batch = 1；没跑 ncu 和 cuSPARSE（T7 不要求）。nsys 每条链每种口径的明细在任务目录 `data/scale1-a100-nsys.csv`。\n"
                 + overlap_note(ops, impl, {row["chain"]: row for row in out}) +
-                f"\n复现（测量时 ksmm 在提交 `{prov['ksmm_commit'][:8]}`；`commits` 里的 `{args.commit[:8]}` 在它之后只加了本发布脚本 "
-                "`audit/publish_t7.py`，测量代码没变）：\n\n```bash\n" + RUN_CMDS + "\n```\n\n"
+                f"\n复现（测量时 zhang-x4 上的 ksmm 在提交 `{prov['ksmm_commit'][:8]}`，工作树干净；`commits` 里的 `{args.commit[:8]}` "
+                "比它多本发布脚本 `audit/publish_t7.py` 和 T4 审阅后的几个提交（publish.py 的说明文字、host_cmp.py，以及 "
+                "a100_audit.py 里判断工作树是否干净的一行）；测量和计时的代码没变）：\n\n```bash\n" + RUN_CMDS + "\n```\n\n"
                 "`x4_gpu_run.sh` 在占卡前检查有没有别人的进程，前后在 gpu-use-log 登记，运行期间用 nvidia-smi 每 200 ms 采样时钟。"
                 "原始 nsys 报告留在 zhang-x4 的 `$A/runs/t7/`。"),
             "columns": cols,
