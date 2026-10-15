@@ -251,8 +251,9 @@ def main() -> None:
     worst = max(ck_rows, key=lambda x: abs(x["legacy_dev_pct"]))
     ours_dev = [x["ours_dev_pct"] for x in ck_rows]
     ck_note = (f"用旧 harness 自己的调用、同样的 do_bench，跑 3 轮取 p80 的中位数，10 条和表的偏差都在 ±10% 以内"
-               f"（最大 {worst['chain']} {worst['legacy_dev_pct']:+.1f}%）。本 harness 的调用（链首尾不转置）比表低 "
-               f"{-max(ours_dev):.1f}% 到 {-min(ours_dev):.1f}%，差的是两次转置的主机开销。逐条见任务 data/a100-checkpoint.csv。")
+               f"（最大 {worst['chain']} {worst['legacy_dev_pct']:+.1f}%）。本 harness 的调用比表低 "
+               f"{-max(ours_dev):.1f}% 到 {-min(ours_dev):.1f}%：长链的 E 主要是露在外面的主机发射时间，而旧调用发一次整条链"
+               "的主机时间多 2.1–7.0 µs（debut_1、debut_5、bfly_1、bfly_4 实测，audit/host_cmp.py）。逐条见任务 data/a100-checkpoint.csv。")
 
     # ---- measurements
     sweep_rows = []
