@@ -63,7 +63,8 @@ COLUMNS = {
     "d_eager_us": "nsys，E 条件（eager 发射、清 L2）：各 kernel 设备时间之和（µs），中位数",
     "h_us": "主机发一次整条链的时间（µs），不等 GPU",
     "rel_l2": "eager 输出对 fp32 稠密参考的相对 L2 误差；≤ 1e-2 记通过（graph 输出另核，见 task data）",
-    "nnz_ratio_padded": "V4.1 补零后的 nnz ÷ 原始 nnz（按运行 v41 的 padded 列算）；1 表示没补零。A100 跑原始维度，大于 1 的链上 V4.1 做的乘加是 A100 的这么多倍，见 config.shape",
+    "nnz_ratio_padded": "V4.1 补零后链的 nnz ÷ 原始链的 nnz（按运行 v41 的 padded 列算），即链的规模之比；1 表示没补零。A100 算原始链，V4.1 算补零后更大的链。KSMM 逐级算，有效乘加数就是原始 nnz，所以对 KSMM 这就是 V4.1 与 A100 的有效乘加之比；cuBLAS、cuSPARSE 算合成后的原始 N_out × M_in 矩阵，乘加数见 macs 列，不能用这个倍数比工作量。见 config.shape",
+    "macs": "batch 1 调用一次的有效乘加数（不算 kernel 内部按块补齐的部分）：ksmm 是原始链的 nnz（Σ A·B·C·D）；cublas 是合成矩阵的 N_out·M_in；cusparse 是 csr_nnz",
     "csr_nnz": "合成矩阵转 CSR 后的非零数",
     "ncu_dram_pct": "ncu：DRAM 吞吐占峰值（%，dram__throughput.avg.pct_of_peak_sustained_elapsed），各 kernel 按时长加权；空着表示这条链没跑 ncu",
     "ncu_l2_hit_pct": "ncu：L2 命中率（%）= 各 kernel 的 lts__t_sectors_lookup_hit 之和 ÷（hit + miss 之和）",
@@ -107,7 +108,7 @@ NCU_CONFIG = ("ncu 2024.3.2（/usr/local/cuda-12.6/bin/ncu）：--replay-mode ap
               "（ksmm、cublas）")
 
 
-def describe(impl: str, ds: str, commit: str, measured_at: str, ck_note: str, shape_note: str) -> str:
+def describe(impl: str, ds: str, commit: str, measured_at: str, ck_note: str, shape_note: str, e_spread: str) -> str:
     extra = {
         "ksmm": f"- **检查点**（只对 v3-reference-data）：{ck_note}\n",
         "cublas": "",
@@ -117,7 +118,7 @@ def describe(impl: str, ds: str, commit: str, measured_at: str, ck_note: str, sh
         f"zhang-x4 上实测（任务 2026-10-14-v41-baseline-audit，步骤 T4）。实现：{IMPL_CONFIG[impl]}。\n\n"
         "- **`time_us` 是 G_cold**（CUDA graph 回放、窗口外清 L2、不含主机发射），是和 V3、V4.1 比对用的数。\n"
         "- E 和结果表 sheet-a100 是同一个口径。E − G_cold 近似露在外面的主机发射时间（限定见 `config.timing.E_minus_G`），"
-        "h_us 是主机发一次整条链的总时间。E 受主机速度影响，跨进程会差到约 20%，看主机开销用 h_us（见 `config.timing.E`）。\n"
+        f"h_us 是主机发一次整条链的总时间。E 受主机速度影响，跨进程会差到{e_spread}，看主机开销用 h_us（见 `config.timing.E`）。\n"
         f"- **形状**：{shape_note}\n"
         "- 口径、时钟、软件版本见 `config`；batch 扫描、nsys 汇总、ncu 明细、检查点、时钟采样在任务目录的 "
         "`data/a100-batch-sweep.csv`、`a100-nsys.csv`、`a100-ncu.csv`、`a100-checkpoint.csv`、`a100-clocks.csv`。\n"
@@ -216,10 +217,12 @@ def fmt_ratio(x: float):
 
 
 def shape_info(ops: Path, dataset: str):
-    """nnz ratio (V4.1 padded / original) per chain, and the text for config.shape."""
+    """Chain sizes of A100 (original) vs. V4.1 / V3 (zero-padded), and the impl-independent part of config.shape."""
     orig = chain_stages(ops, dataset)
     v41 = run_shapes(ops, dataset, "v41", "padded")
     v3 = run_shapes(ops, dataset, "v3-eb02", "shape_run")
+    with open(ops / "datasets" / dataset / "runs" / "v3-eb02" / "results.csv", encoding="utf-8", newline="") as stream:
+        v3_rows = {row["chain"]: row for row in csv.DictReader(stream)}
     ratio = {c: nnz(v41[c]) / nnz(st) for c, st in orig.items()}
     changed = [c for c in orig if v41[c] != orig[c]]
     items = []
@@ -232,19 +235,38 @@ def shape_info(ops: Path, dataset: str):
     text = ("A100 的三种实现都按 chains.csv 的原始维度算，不补零。V3（运行 v3-eb02 的 shape_run 列）和 V4.1（运行 v41 的 padded 列）"
             f"跑的是补零后的形状。本数据集 {len(orig)} 条链里有 {len(changed)} 条补零后形状变了")
     if changed:
-        text += (f"，V4.1 的 nnz 是原始的 {fmt_ratio(min(ratio[c] for c in changed))}–{fmt_ratio(max(ratio[c] for c in changed))} 倍，"
-                 "这些链上 A100 做的乘加比 V4.1 少：" + "；".join(items) + "。")
+        text += (f"，V4.1 算的链比 A100 的大，链的规模（nnz）是原始的 {fmt_ratio(min(ratio[c] for c in changed))}–"
+                 f"{fmt_ratio(max(ratio[c] for c in changed))} 倍：" + "；".join(items) + "。")
         v3diff = [c for c in changed if c in v3 and v3[c] != v41[c]]
         if v3diff:
             b1 = all(any(b == 1 for _a, b, _c, _d in orig[c]) for c in v3diff)
             text += (f"其中 {len(v3diff)} 条" + ("有 B = 1 的级，" if b1 else "") + "V3 的补法和 V4.1 不同，V3 的倍数是："
                      + "；".join(f"{c} {fmt_ratio(nnz(v3[c]) / nnz(orig[c]))} 倍" for c in v3diff) + "。")
+            skipped = [c for c in v3diff if not v3_rows[c].get("cycles") and v3_rows[c]["note"].startswith("V3 求解器判为 SKIP")]
+            if skipped:
+                text += (f"V3 在其中 {len(skipped)} 条（{'、'.join(skipped)}）上求解器判为 SKIP，运行 v3-eb02 里 check 是"
+                         f"「{v3_rows[skipped[0]]['check']}」、没有周期。")
     else:
         text += "。"
-    text += "其余链三方形状相同。列 nnz_ratio_padded 按 V4.1 算"
-    short = (f"A100 跑原始维度，V3、V4.1 跑补零后的形状；本数据集有 {len(changed)} 条链两边工作量不同"
-             "（`nnz_ratio_padded` > 1），详见 `config.shape`。")
-    return ratio, text, short
+    text += "其余链三方形状相同。列 nnz_ratio_padded 按 V4.1 算。"
+    return ratio, {c: nnz(v41[c]) for c in orig}, changed, text
+
+
+def shape_impl(impl: str, changed: list, padded_nnz: dict, macs: dict) -> tuple:
+    """Impl-specific end of config.shape and the description bullet: what the nnz ratio means for this impl."""
+    if impl == "ksmm":
+        tail = ("KSMM 逐级算原始链，有效乘加数就是原始 nnz（macs 列），所以这些链上 V4.1 比 A100 多做了补零的部分，"
+                "倍数就是 nnz_ratio_padded")
+        short = "对 KSMM，这就是 V4.1 与 A100 的有效乘加之比"
+    else:
+        what = "稠密矩阵，有效乘加数是 N_out·M_in" if impl == "cublas" else "矩阵转成的 CSR，有效乘加数是 csr_nnz"
+        tail = (f"{'cuBLAS' if impl == 'cublas' else 'cuSPARSE'} 算的是合成后的原始 N_out × M_in {what}（macs 列），"
+                "由合成矩阵的大小决定，不能用 nnz_ratio_padded 比工作量")
+        if changed:
+            k = [macs[c] / padded_nnz[c] for c in changed]
+            tail += f"：上面这些链上，它是 V4.1 补零后 nnz 的 {min(k):.1f}–{max(k):.1f} 倍"
+        short = f"{'cuBLAS' if impl == 'cublas' else 'cuSPARSE'} 的乘加数由合成矩阵决定（macs 列），不能用这个倍数比工作量"
+    return tail, short
 
 
 def clock_summary(path: Path) -> dict:
@@ -386,7 +408,11 @@ def main() -> None:
     d5_e = [float(x["e_p80_ours_us"]) for x in d5_hc]
     d5_h = [float(x["h_ours_us"]) for x in d5_hc]
     h_all = d5_h + [meas_ref["debut_5"]["h_us"], 175.8]
-    e_note = ("。h_us 大于清零时间（约 150 µs）的链，E 受主机发射限制，跟着主机速度一比一变，不同进程之间实测相差可到约 20%："
+    e_all = d5_e + [meas_ref["debut_5"]["e_p80"], 52.22,
+                    next(x["ours_p80_median"] for x in ck_rows if x["chain"] == "debut_5")]
+    e_spread = f"约 {(max(e_all) - min(e_all)) / max(e_all) * 100:.0f}%（{max(e_all):.2f} 对 {min(e_all):.2f} µs）"
+    e_note = ("。h_us 大于清零时间（约 150 µs）的链，E 受主机发射限制，跟着主机速度一比一变，不同进程之间实测相差可到"
+              f"{e_spread}："
               "本 harness 同一个 ksmm 调用的 debut_5 E p80，检查点进程 "
               f"{next(x['ours_p80_median'] for x in ck_rows if x['chain'] == 'debut_5')} µs，measure 进程 "
               f"{round(meas_ref['debut_5']['e_p80'], 2)} µs，host_cmp 的 3 个进程 {min(d5_e):.2f}–{max(d5_e):.2f} µs，审阅复测 52.22 µs"
@@ -408,7 +434,7 @@ def main() -> None:
             if x["kind"] == "point":
                 latest[(x["chain"], x["impl"], x["batch"])] = x
         order = chain_order(ops, ds)
-        ratio, shape_text, shape_short = shape_info(ops, ds)
+        ratio, padded_nnz, changed, shape_common = shape_info(ops, ds)
         for chain in order:
             for impl in IMPLS:
                 for (c, i, b), x in sorted(latest.items(), key=lambda kv: kv[0][2]):
@@ -427,6 +453,7 @@ def main() -> None:
                     })
         for impl in IMPLS:
             out = []
+            macs = {}
             for chain in order:
                 x = latest.get((chain, impl, 1))
                 if x is None:
@@ -446,10 +473,16 @@ def main() -> None:
                 row.update(ncu_sum.get((ds, chain, impl, 1), {k: "" for k in (
                     "ncu_dram_pct", "ncu_l2_hit_pct", "ncu_sm_pct", "ncu_occ_pct", "ncu_tensor_pct", "ncu_waves")}))
                 row["nnz_ratio_padded"] = fmt_ratio(ratio[chain])
+                macs[chain] = {"ksmm": x["nnz"], "cublas": x["m_in"] * x["n_out"]}.get(impl, x.get("csr_nnz"))
+                row["macs"] = macs[chain]
                 row["note"] = x.get("error", "")
                 out.append(row)
             run_dir = ops / "datasets" / ds / "runs" / f"a100-{impl}"
             write_csv(run_dir / "results.csv", out)
+            tail, impl_short = shape_impl(impl, changed, padded_nnz, macs)
+            shape_text = shape_common + tail
+            shape_short = (f"A100 跑原始维度，V3、V4.1 跑补零后的形状；本数据集有 {len(changed)} 条链 V3、V4.1 算的链比 A100 的大"
+                           f"（`nnz_ratio_padded` > 1，链的规模之比）。{impl_short}。详见 `config.shape`。")
             cols = dict(COLUMNS)
             if impl != "cusparse":
                 cols.pop("csr_nnz")
@@ -497,7 +530,7 @@ def main() -> None:
                     "measured_tree_dirty": prov["ksmm_dirty"],
                     "loadavg_start": prov["loadavg_start"],
                 },
-                "description": describe(impl, ds, args.commit, prov["ksmm_commit"], ck_note, shape_short),
+                "description": describe(impl, ds, args.commit, prov["ksmm_commit"], ck_note, shape_short, e_spread),
                 "columns": cols,
             }
             (run_dir / "run.json").write_text(json.dumps(run, ensure_ascii=False, indent=1) + "\n", encoding="utf-8")
