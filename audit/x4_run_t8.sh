@@ -11,6 +11,7 @@
 #   ncu-best     T4's ncu metrics on bfly_4 batch 4096 with config 256/1/3 (application replay; G3-r1 S4)
 #   flushcmp     G_cold with T4's zero_() flush vs a read-only flush: every published cuBLAS chain at batch 1
 #                (v3-reference-data, v1, scale1) and KSMM controls (decision 2026-10-15 03:21 EDT)
+#   flushcmp-big repeat of flushcmp on the 2^14-2^16 cuBLAS chains, clean flush first, 3 rounds
 #
 # Usage: x4_run_t8.sh <physical GPU> [step ...]
 # Triton cache: a copy of T4's cache ($A/.triton -> $A/.triton-t8), so the default autotune picks are T4's
@@ -137,6 +138,13 @@ for step in $steps; do
       "$RUN" "$gpu" "$O/clk-flushcmp-ksmm2.csv" "v41-audit T8 G_cold zero vs read-only L2 flush, ksmm controls scale1" \
         "$PY" "$P" flushcmp --chains "$D/scale1/chains.csv" --dataset scale1 \
         --only r2v_8192,r2v_65536,r4_65536,debut_rect_65536 --impls ksmm --out "$O/flushcmp.jsonl"
+      ;;
+    flushcmp-big)
+      # matrices far above L2 (2^14-2^16): the first zero-flush round was slow; repeat with the clean flush first
+      "$RUN" "$gpu" "$O/clk-flushcmp-big.csv" "v41-audit T8 G_cold flush repeat, scale1 cublas 2^14-2^16, clean first" \
+        "$PY" "$P" flushcmp --chains "$D/scale1/chains.csv" --dataset scale1 --impls cublas --rounds 3 \
+        --order clean,zero --tag repeat-clean-first \
+        --only r2v_16384,r2t_32768,r2v_32768,r2t_65536,r2v_65536,r4_65536,debut_rect_65536 --out "$O/flushcmp-big.jsonl"
       ;;
     *) echo "unknown step $step" >&2; exit 2 ;;
   esac

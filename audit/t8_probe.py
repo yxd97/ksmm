@@ -240,10 +240,12 @@ def cmd_flushcmp(args) -> None:
     (sum() over another 256 MB buffer: L2 left with clean lines). Same graph, alternating, `--rounds` each."""
     torch, _triton, ks_forward, clock, flush, out = setup(args, "flushcmp")
     clean_buf = torch.ones(base.FLUSH_BYTES // 4, dtype=torch.int32, device="cuda")
-    pres = {"zero": flush.zero_, "clean": lambda: clean_buf.sum()}
+    every = {"zero": flush.zero_, "clean": lambda: clean_buf.sum()}
+    pres = {m: every[m] for m in args.order.split(",")}  # measured in this order in every round
     for chain in base.select(base.read_chains(Path(args.chains)), args.only):
         for impl in args.impls.split(","):
-            row = {"kind": "flushcmp", "dataset": args.dataset, "chain": chain.name, "impl": impl,
+            row = {"kind": "flushcmp", "tag": args.tag, "order": args.order, "dataset": args.dataset,
+                   "chain": chain.name, "impl": impl,
                    "batch": args.batch, "m_in": chain.m_in, "n_out": chain.n_out, "stages": len(chain.stages)}
             graph = call = None
             try:
@@ -330,6 +332,8 @@ def main() -> None:
     fc.add_argument("--impls", default="cublas")
     fc.add_argument("--batch", type=int, default=1)
     fc.add_argument("--rounds", type=int, default=2)
+    fc.add_argument("--order", default="zero,clean", help="flush kinds in measuring order within a round")
+    fc.add_argument("--tag", default="", help="free text stored with every row (e.g. a repeat)")
     fc.set_defaults(fn=cmd_flushcmp)
 
     r = sub.add_parser("profile", help="ncu / nsys workload without fp32 composition")
