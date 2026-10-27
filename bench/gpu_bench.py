@@ -179,7 +179,6 @@ def cmd_time(args) -> None:
         exit_if_busy(uuid)
         started = time.perf_counter()
         row = {**base_row(dataset, chain, args, uuid), "n_runs": args.n_runs}
-        built = x = ref = impl = graph = None
         try:
             built = audit.Built(torch, chain)
             x = audit.make_input(torch, chain, args.batch)
@@ -189,34 +188,27 @@ def cmd_time(args) -> None:
             torch.cuda.synchronize()
             efin, erel, _ = audit.rel_errors(torch, y, ref)
             row["config"] = impl.config()
-            graph, gy = audit.capture_graph(torch, lambda: run_set(impl.run, args.n_runs))
+            run = impl.run
+            graph, gy = audit.capture_graph(torch, lambda r=run: run_set(r, args.n_runs))
             gfin, grel, _ = audit.rel_errors(torch, gy, ref)
-            del y, gy, ref
+            y = gy = ref = None  # free before the replays
             ok = efin and gfin and erel <= audit.TOL_REL_L2 and grel <= audit.TOL_REL_L2
             row.update(eager_finite=efin, eager_rel_l2=erel, graph_finite=gfin, graph_rel_l2=grel,
                        rel_l2=max(erel, grel), check="通过" if ok else "失败")
-            # Event times of whole replays: warm-up (not traced) vs. traced, for the nsys bias.
-            ev = [torch.cuda.Event(enable_timing=True) for _ in range(WARMUP_REPLAYS + TRACED_REPLAYS + 1)]
-            ev[0].record()
-            for k in range(WARMUP_REPLAYS):
+            for _ in range(WARMUP_REPLAYS):
                 graph.replay()
-                ev[k + 1].record()
             torch.cuda.synchronize()
             torch.cuda.profiler.start()
             for k in range(TRACED_REPLAYS):
                 torch.cuda.nvtx.range_push(f"{chain.name}/r{k}")
                 graph.replay()
                 torch.cuda.nvtx.range_pop()
-                ev[WARMUP_REPLAYS + k + 1].record()
             torch.cuda.synchronize()
             torch.cuda.profiler.stop()
-            us = [a.elapsed_time(b) * 1000.0 for a, b in zip(ev, ev[1:])]
-            # the first traced replay starts after the synchronize, so its window includes launch latency
-            row.update(replay_us_untraced=us[:WARMUP_REPLAYS], replay_us_traced=us[WARMUP_REPLAYS:])
         except Exception as exc:  # record and go on with the next chain
             row.update(check="失败", error=f"{type(exc).__name__}: {str(exc)[:2000]}")
         finally:
-            del built, x, ref, impl, graph
+            built = x = ref = impl = run = graph = None  # free the GPU memory of this chain
             torch.cuda.synchronize()
             torch.cuda.empty_cache()
         row["sm_mhz_end"], row["mem_mhz_end"] = clock.sm_mem()
@@ -321,7 +313,11 @@ def cmd_parse(args) -> None:
     path = out / "timing.jsonl"
     time_rows = latest(out / "time.jsonl", "point")
     parsed = {r["report"] for r in read_rows(path, "timing")}
-    for rep in sorted((out / "nsys").glob("*.nsys-rep")):
+    def order(rep: Path):  # time-<stamp>.<k>.nsys-rep, k = 1, 2, ... per cudaProfilerStart/Stop range
+        stamp, k = rep.name.split(".")[:2]
+        return stamp, int(k)
+
+    for rep in sorted((out / "nsys").glob("*.nsys-rep"), key=order):
         if rep.name in parsed:
             continue
         sql = rep.with_suffix(".sqlite")
@@ -464,17 +460,17 @@ def cmd_power(args) -> None:
         exit_if_busy(uuid)
         started = time.perf_counter()
         row = base_row(dataset, chain, args, uuid)
-        built = x = impl = graph = feeder = None
         try:
             device_us = timing[chain.name]["device_us"]  # KeyError: time and parse this chain first
             built = audit.Built(torch, chain)
             x = audit.make_input(torch, chain, args.batch)
             impl = make(torch, built, x)
-            impl.run()
+            run = impl.run
+            run()
             torch.cuda.synchronize()
             n_runs, trials = N_RUNS, []
             while True:
-                graph, _ = audit.capture_graph(torch, lambda: run_set(impl.run, n_runs))
+                graph, _ = audit.capture_graph(torch, lambda r=run, n=n_runs: run_set(r, n))
                 feeder = Feeder(torch, graph)
                 trials.append([n_runs, round(trial(torch, feeder, n_runs, device_us), 2)])
                 if trials[-1][1] >= BUSY_MIN_PCT or n_runs >= POWER_N_RUNS_MAX:
@@ -490,6 +486,7 @@ def cmd_power(args) -> None:
                 at[i] = fd.n
 
             res = energy_window(clock, feeder.step, mark)
+            del mark  # it holds the feeder and so the graph
             torch.cuda.synchronize()
             replays = at[1] - at[0]
             window_ms = ev[0].elapsed_time(ev[1])
@@ -501,7 +498,7 @@ def cmd_power(args) -> None:
         except Exception as exc:  # record and go on with the next chain
             row.update(error=f"{type(exc).__name__}: {str(exc)[:2000]}")
         finally:
-            del built, x, impl, graph, feeder
+            built = x = impl = run = graph = feeder = None  # free the GPU memory of this chain
             torch.cuda.synchronize()
             torch.cuda.empty_cache()
         row["elapsed_s"] = round(time.perf_counter() - started, 3)
