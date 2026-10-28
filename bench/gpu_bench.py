@@ -8,8 +8,8 @@ input come from a100_audit.Built / make_input (seed: crc32 of the chain name).
 Subcommands (run them through run_host.sh, which picks the GPU):
 
   idle    idle power of the GPU in CUDA_VISIBLE_DEVICES; NVML only, no CUDA context.
-  time    per chain: eager run + check, capture the n_runs graph + check, 3 warm-up replays,
-          then R back-to-back replays with a CUDA event between replays, all submitted while a
+  time    per chain: eager run + check, capture the n_runs graph + check, WARMUP_S seconds of
+          continuous replays (stable clocks), then R back-to-back replays with a CUDA event between replays, all submitted while a
           wait kernel holds the GPU; device_us = event gap / n_runs. No tracing.
   power   per chain: pick power_n_runs (busy_pct >= 95 %), replay 120 s, energy from 30 s to 90 s.
 
@@ -38,7 +38,7 @@ sys.path.insert(0, str(ROOT / "audit"))
 import a100_audit as audit  # noqa: E402  (also puts ksmm/src on sys.path)
 
 N_RUNS = 20  # runs per graph for timing
-WARMUP_REPLAYS = 3
+WARMUP_S = 0.5  # continuous replays before timing, so the GPU reaches its steady clock (calibrated, README)
 REPLAYS = 100  # timed replays R; fewer for long replays:
 LONG_REPLAY_MS = 10.0  # a replay longer than this gets R = about TIMED_TOTAL_MS of replays,
 TIMED_TOTAL_MS = 1000.0
@@ -162,6 +162,19 @@ def base_row(dataset: str, chain, args, uuid: str) -> dict:
 # --------------------------------------------------------------------------- time
 
 
+def warm_up(torch, graph, seconds: float) -> float:
+    """Replay continuously for `seconds` as in the power phase; returns the mean GPU ms per replay."""
+    feeder = Feeder(torch, graph)
+    start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+    start.record()
+    t0 = time.perf_counter()
+    while time.perf_counter() - t0 < seconds:
+        feeder.step()
+    end.record()
+    torch.cuda.synchronize()
+    return start.elapsed_time(end) / feeder.n
+
+
 def timed_replays(torch, graph, replays: int) -> dict:
     """`replays` back-to-back replays with a CUDA event before the first and after each one.
 
@@ -217,19 +230,13 @@ def cmd_time(args) -> None:
             ok = efin and gfin and erel <= audit.TOL_REL_L2 and grel <= audit.TOL_REL_L2
             row.update(eager_finite=efin, eager_rel_l2=erel, graph_finite=gfin, graph_rel_l2=grel,
                        rel_l2=max(erel, grel), check="通过" if ok else "失败")
-            warm = [torch.cuda.Event(enable_timing=True) for _ in range(2)]
-            warm[0].record()
-            for _ in range(WARMUP_REPLAYS):
-                graph.replay()
-            warm[1].record()
-            torch.cuda.synchronize()
-            per_ms = warm[0].elapsed_time(warm[1]) / WARMUP_REPLAYS
+            per_ms = warm_up(torch, graph, WARMUP_S)
             replays = REPLAYS if per_ms <= LONG_REPLAY_MS else max(MIN_REPLAYS, round(TIMED_TOTAL_MS / per_ms))
             res = timed_replays(torch, graph, replays)
             dev = [ms * 1000.0 / args.n_runs for ms in res["replay_ms"]]
             p20, p50, p80 = audit.quantiles(dev)
-            row.update(device_us=p50, device_p20=p20, device_p80=p80, replays=replays, warmup_replay_ms=per_ms,
-                       **res)
+            row.update(device_us=p50, device_p20=p20, device_p80=p80, replays=replays, warmup_s=WARMUP_S,
+                       warmup_replay_ms=per_ms, **res)
         except Exception as exc:  # record and go on with the next chain
             row.update(check="失败", error=f"{type(exc).__name__}: {str(exc)[:2000]}")
         finally:

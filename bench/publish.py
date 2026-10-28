@@ -44,12 +44,14 @@ IMPL_TEXT = {
                "录 graph 前先 eager 调用一次，Triton autotune 在这时选配置（TRITON_CACHE_AUTOTUNING=1 存盘），"
                "选中的配置记在 time.jsonl 的 config 字段"),
 }
-TIMING_TEXT = (f"每条链录一个 CUDA graph，里面 {gb.N_RUNS} 个首尾相接的 run，run 之间不清 L2。热身回放 {gb.WARMUP_REPLAYS} 次，"
+TIMING_TEXT = (f"每条链录一个 CUDA graph，里面 {gb.N_RUNS} 个首尾相接的 run，run 之间不清 L2。热身：像功率阶段那样连续回放 "
+               f"W = {gb.WARMUP_S} s（主机最多领先 {gb.LEAD} 次），让 GPU 升到稳定频率（W 的标定见 ksmm bench/README.md）。"
                f"再连续回放 R 次（R = {gb.REPLAYS}；单次回放超过 {gb.LONG_REPLAY_MS:.0f} ms 的链取总时长约 "
                f"{gb.TIMED_TOTAL_MS / 1000:.0f} s，不少于 {gb.MIN_REPLAYS}），第一次回放前和每次回放后各记一个 CUDA event。"
                f"提交前先在流上放一个等待 kernel（torch.cuda._sleep，从 {gb.WAIT_CYCLES} 个周期起），R 次回放和 event 都在它运行时提交；"
                "提交完时第一个 event 还没完成才算数（wait_ok），否则等待加倍重测。device = 相邻 event 之差 ÷ 20，"
-               "报 R 个值的中位数、p20、p80（线性插值）。不用 nsys、ncu")
+               "报 R 个值的中位数、p20、p80（线性插值）。不用 nsys、ncu。已知偏差，照实发布、不修正：每次回放之间记的计时 event "
+               "让每个 run 多约 0.11 µs（A6000 上 debut_butterfly16 每次回放之间都记 event 是 4.587 µs/run，只在两头记是 4.476 µs/run）")
 POWER_TEXT = (f"待机：只用 pynvml、不建 CUDA 上下文，测 {gb.POWER_S:.0f} s。工作：功率 graph 与计时是同一条链、同样的 run，"
               f"run 数从 {gb.N_RUNS} 起，不开追踪试跑 {gb.TRIAL_S:.0f} s，busy_pct < {gb.BUSY_MIN_PCT:.0f}% 就翻倍，最多 "
               f"{gb.POWER_N_RUNS_MAX}；选定后连续回放 {gb.POWER_S:.0f} s，主机最多领先 GPU {gb.LEAD} 次回放。"
