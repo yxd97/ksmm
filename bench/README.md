@@ -135,5 +135,6 @@ IMPLS = {"triton": make_triton, "cuda": make_cuda}
 
 在 A6000（zhang-capra-xcel GPU0）上看到的现象：
 
-- 每次回放之间记带计时的 event，会让每次回放长约 2 µs：`debut_butterfly16` 每个 run 摊到约 0.11 µs，即 4.59 µs 对 4.48 µs；只在两头记 event 时是 4.48 µs。计划要求逐次回放记 event，这个偏差留在 `device_us` 里。
-- 功率阶段连续回放几十秒，时钟和计时阶段的短测不同，所以功率窗口里平均每个 run 的时间和 `device_us` 不完全相同，`busy_pct` 可能偏离 100%。
+- 每次回放之间记带计时的 event，每次回放长约 2 µs。`debut_butterfly16` 上，平均每个 run 是 4.59 µs；只在两头记 event 时是 4.48 µs。计划要求逐次回放记 event，这个偏差留在 `device_us` 里。
+- 不锁频。短链的 `device_us` 随 GPU 是否已经升频而变：`debut_butterfly16` 在同一进程里连测 3 次，中位数是 4.608、4.608、4.352 µs，测完时 SM 时钟 1800 MHz。连续回放 3 s 后再测是 4.352 µs，SM 时钟 1920 MHz；功率阶段那样连续提交时，平均每个 run 4.22 µs。
+- 所以功率窗口里平均每个 run 的时间和 `device_us` 不完全相同，`busy_pct` 可能偏离 100%。短功率测试中，`debut_butterfly16` 的 `busy_pct` 是 110%，`butterfly_8192` 是 98%。
