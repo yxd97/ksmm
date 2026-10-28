@@ -153,6 +153,9 @@ IMPLS = {"triton": make_triton, "cuda": make_cuda}
 
 在 A6000（zhang-capra-xcel GPU0）上看到的现象：
 
-- 每次回放之间记带计时的 event，每次回放长约 2 µs。`debut_butterfly16` 上，平均每个 run 是 4.59 µs；只在两头记 event 时是 4.48 µs。计划要求逐次回放记 event，这个偏差留在 `device_us` 里。
-- 不锁频。短链的 `device_us` 随 GPU 是否已经升频而变：`debut_butterfly16` 在同一进程里连测 3 次，中位数是 4.608、4.608、4.352 µs，测完时 SM 时钟 1800 MHz。连续回放 3 s 后再测是 4.352 µs，SM 时钟 1920 MHz；功率阶段那样连续提交时，平均每个 run 4.22 µs。
-- 所以功率窗口里平均每个 run 的时间和 `device_us` 不完全相同，`busy_pct` 可能偏离 100%。短功率测试中，`debut_butterfly16` 的 `busy_pct` 是 110%，`butterfly_8192` 是 98%。
+- 每次回放之间记带计时的 event，每次回放长约 2 µs。`debut_butterfly16` 上，平均每个 run 是 4.587 µs；只在两头记 event 时是 4.476 µs，相差约 0.11 µs/run。计划要求逐次回放记 event，这个偏差照实留在 `device_us` 里，`run.json` 的 `config.timing` 写明。
+- 不锁频。只热身 3 次回放时，短链的 `device_us` 随 GPU 是否已经升频而变（`debut_butterfly16` 是 4.608 µs 对 4.352 µs），所以热身改为连续回放 W 秒，W 的标定见上一节。
+- W = 0.5 s 时的重复性（提交 294e01e，A6000）：同一进程先测 `debut_butterfly16`，再测 B1 的其余 65 条链，最后再测一次 `debut_butterfly16`，两次隔 4 分 16 秒，结果 4.326 µs 对 4.352 µs，相差 +0.6%。
+- `busy_pct` 可能略超过 100%。一部分原因是 `device_us` 含计时 event 的开销（约 0.11 µs/run），功率窗口里记的是不计时的 event。短功率测试中（20 s，窗口 5–15 s）：
+  - `debut_butterfly16`：`device_us` 4.352 µs，窗口里平均每个 run 4.183 µs，`busy_pct` 104.0%。
+  - `butterfly_8192`：`device_us` 59.955 µs，窗口里平均每个 run 59.925 µs，`busy_pct` 100.05%。
