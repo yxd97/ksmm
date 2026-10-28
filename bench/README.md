@@ -8,6 +8,7 @@
 | `gpu_bench.py` | 测量：子命令 `idle`、`time`、`power` |
 | `run_host.sh` | 在主机上跑一个子命令：选卡、查占用、写 gpu-use-log、nvidia-smi 采样、缓存重定向 |
 | `publish.py` | 把一个输出目录写成 `run.json` 和 `results.csv`（只用标准库，在 zhang-22 上跑） |
+| `ksmm_cuda/` | 实现 `cuda`：`build.py` 生成并编译 ksmm-cuda 的 torch 扩展，`__init__.py` 加载它，见「ksmm-cuda」 |
 
 ```mermaid
 flowchart LR
@@ -35,7 +36,7 @@ $B/run_host.sh 1 $O "gpu-bench b1 power" power --chains $C --batch 1        # 3.
   - 卡上有别人的进程就退出，退出码 75。`time`、`power` 每条链开始前再查一次，`idle` 前后各查一次；查到就以 75 退出，已写的行保留。
   - 主机名是 `en-ec-zhang-x4` 时，开始、结束各往 `/scratch/users/gpu-use-log/$USER.log` 写一行。其他主机不写。
   - nvidia-smi 每 200 ms 采样，存为 `<输出目录>/smi-<子命令>-<时间>.csv`。
-- `time`、`power` 的参数：`--chains <数据集>/chains.csv`（数据集名取目录名）、`--only a,b,c`、`--impl triton`、`--batch`（B1、B2 是 1，B3 是 25088）、`--n-runs`（只 `time`，默认 20）。
+- `time`、`power` 的参数：`--chains <数据集>/chains.csv`（数据集名取目录名）、`--only a,b,c`、`--impl triton` 或 `cuda`、`--batch`（B1、B2 是 1，B3 是 25088）、`--n-runs`（只 `time`，默认 20）。
 - 断点续测：每条链结束写一行 JSONL。重跑同一条命令，已有行的链跳过。
 - 发布（在 zhang-22 上，先把输出目录 rsync 回来）：
 
@@ -148,6 +149,58 @@ IMPLS = {"triton": make_triton, "cuda": make_cuda}
 - 超参缺失、跑不了时在 `make` 里抛异常，这条链记「失败」并写 `error`。计划要求记「未运行」的情况（B3 的 cuda 没有超参的 56 条），用 `--only` 不跑它们，`publish.py` 自动记「未运行」，`note` 由发布者补写。
 - 在 `publish.py` 的 `IMPL_TEXT` 里加一句实现说明，写进 `run.json` 的 `config.impl`。
 - 命令行：`--impl cuda`。
+
+## ksmm-cuda（`--impl cuda`）
+
+ksmm 自带的 CUDA kernel，只用于 B3：fp16，batch 在后（bs_last，即 BSL），batch = 25088，A6000（sm_86）。
+
+```mermaid
+flowchart LR
+  B[("src/.../kernel_bs_last_half.best<br>batch=25088 的行")] --> G["ksmm_cuda/build.py<br>生成分派表和编译单元"]
+  T[("src/.../template_kernels_half.cuh<br>只读 include")] --> G
+  G --> D[("$S/ksmm-cuda-build/<br>src/、build/*.so、manifest.json")]
+  D --> I["ksmm_cuda/__init__.py<br>gpu_bench.py --impl cuda"]
+```
+
+- **超参**：只取 `kernel_bs_last_half.best` 里 batch = 25088 的行（第 1 列是 batch，第 2–5 列是 a、b、c、d，第 6–11 列是 TILEX、TILEK、TILEY、TX、TY、VSIZE）。没有超参的 pattern 不跑，不用 `kernel.py` 的回退搜索（它不看 batch，`kernel.py:171-173`）。
+  - 表里 batch = 25088 有 687 行、675 个不同的 pattern。重复的行完全相同，`build.py` 遇到不同的重复行就报错。
+  - VSIZE 照表取（2 或 4），模板实例的写法照 `kernel.py:28-35`：VSIZE 4 用 `kernel_bs_last_half4<bool, …, false, TILEX/TX>`，VSIZE 2 用 `kernel_bs_last_half2<half2, …, true, TILEX/TX>`。
+- **不改 `src/`**：`kernel.py:247-284` 会改写受追踪的 `.cuh`，所以不调用它。`build.py` 只读 `template_kernels_half.cuh`（用 `-I` include），自己生成分派表。
+- **编译单元**：模板参数只有 (TILEX, TILEK, TILEY, TX, TY, VSIZE)，a、b、c、d 是运行时参数。所以按参数组合拆编译单元：675 个 pattern 只用到 50 种组合，生成 50 个 `cfgNN.cu`，加一个 `binding.cpp`（pattern → 启动函数的表）。
+- **stream**：每个 kernel 用 `<<<grid, block, 0, c10::cuda::getCurrentCUDAStream()>>>` 启动（`at::cuda::getCurrentCUDAStream` 就是这个函数），所以能录进 graph。输出用 `torch::empty` 从缓存分配器分配。
+- **检查**：扩展只接受表里的 pattern、fp16、连续、x 形状 (a·c·d, 25088)；其他情况抛异常，这条链记「失败」。
+- **权重**：`built.k_bmm[k]`（形状 (A·D, C, B)）按 (A·D·C, B) 传入，和 `interface.py:69` 的 kernel 格式相同。
+- **精度**：kernel 用 fp16 累加（`template_kernels_half.cuh` 的 `__hadd(tmp_acc, __hmul(...))`），核对可能失败。失败照实记。
+
+### 生成和编译（在 zhang-capra-xcel 上）
+
+```bash
+export S=/work/zhang-capra/users/yd383/kroissant-project/scratch
+export TRITON_CACHE_DIR=$S/.triton XDG_CACHE_HOME=$S/.cache TMPDIR=$S/tmp PYTHONDONTWRITEBYTECODE=1
+export CUDA_HOME=/usr/local/cuda-12.1 CUDA_VISIBLE_DEVICES=""   # nvcc 的选择见 env.md「T4 · ksmm-cuda 的编译工具链」；编译不用 GPU
+mkdir -p $S/ksmm-cuda-build
+$S/venv-cu126/bin/python <ksmm>/bench/ksmm_cuda/build.py --out $S/ksmm-cuda-build --jobs 8 > $S/ksmm-cuda-build/build.log 2>&1
+```
+
+- 输出：`$S/ksmm-cuda-build/src/`（生成的源文件）、`build/ksmm_cuda_bsl_half.so`（ninja 构建，`torch.utils.cpp_extension.load`）、`manifest.json`（pattern 数、组合数、编译目标 `sm_86`、`.best`、模板和 `.so` 的 sha256、nvcc 和 torch 版本、用时）。
+- `TORCH_CUDA_ARCH_LIST=8.6` 由 `build.py` 设置，只生成 `sm_86`。并行度 `--jobs`（即 `MAX_JOBS`）默认 8：机器有 48 核，别人也在用，8 个已经够快。
+- 用时（2026-10-27 23:07 EDT 清空后重编，`--jobs 8`，负载约 2.3–2.8）：`build_s` 17.4 s，`/usr/bin/time` 的 wall 19.22 s（22:51 EDT 的第一次全量编译是 17.3 s）。每个 `cfgNN.cu` 约 1.6–2.8 s，`binding.cpp`（含 torch 头文件）16.9 s，是关键路径。
+- 估算（同一天 22:50 EDT）：先用 `--limit 10`（前 10 个 pattern，2 种组合）编到另一个目录，用了 17.0 s。按组合算全量约 50 × 1.6 s ÷ 8 + 17 s，远低于 8 小时。
+- `--limit N` 只用于估算，正式构建不用。
+
+### 运行
+
+```bash
+export S=/work/zhang-capra/users/yd383/kroissant-project/scratch PY=$S/venv-cu126/bin/python
+B=$S/ksmm-gpu-bench/bench; C=$S/datasets/b3/chains.csv
+ONLY=$($PY $B/ksmm_cuda/build.py --covered $C)    # 有超参的链名，逗号分隔；stderr 打印「672 chains covered」
+$B/run_host.sh <卡号> $S/gpu-bench/b3-a6000-ksmm-cuda "gpu-bench b3 cuda" time --impl cuda --chains $C --only "$ONLY" --batch 25088
+```
+
+- 扩展从 `$KSMM_CUDA_BUILD/build/ksmm_cuda_bsl_half.so` 加载，没设 `KSMM_CUDA_BUILD` 时用 `$S/ksmm-cuda-build`。运行时不需要 nvcc。
+- 溯源：`time.jsonl` 的 provenance 行多一个 `cuda_build`，就是同一构建目录的 `manifest.json`。读它时核对 `.so` 的 sha256，和 manifest 不符就报错（要重编）。`publish.py` 把它写进 `run.json` 的 `config.cuda_build`。
+- `--covered` 只用标准库，也能在 zhang-22 上用 `python3` 跑。B3 的 728 条里 672 条有超参；其余 56 条不跑，`publish.py` 记「未运行」，`note` 由发布者补写「没有 batch=25088 的 fp16 bs_last 超参」。
+- `config` 字段是每级的超参：`TILEX×TILEK×TILEY/tTX×TY/vVSIZE`，例如 `16x16x128/t8x4/v4`。
 
 ## 已知现象
 
