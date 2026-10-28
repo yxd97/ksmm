@@ -8,6 +8,7 @@
 | `gpu_bench.py` | 测量：子命令 `idle`、`time`、`power` |
 | `run_host.sh` | 在主机上跑一个子命令：选卡、查占用、写 gpu-use-log、nvidia-smi 采样、缓存重定向 |
 | `publish.py` | 把一个输出目录写成 `run.json` 和 `results.csv`（只用标准库，在 zhang-22 上跑） |
+| `triton_full.py` | 实现 `triton-full`：作者注释掉的完整 autotune 空间，见「triton-full」 |
 | `ksmm_cuda/` | 实现 `cuda`：`build.py` 生成并编译 ksmm-cuda 的 torch 扩展，`__init__.py` 加载它，见「ksmm-cuda」 |
 
 ```mermaid
@@ -142,13 +143,22 @@ def make_cuda(torch, built, x) -> Impl:
         return y
     return Impl(run, lambda: "<超参>")
 
-IMPLS = {"triton": make_triton, "cuda": make_cuda}
+IMPLS = {"triton": make_triton, "triton-full": make_triton_full, "cuda": make_cuda}
 ```
 
 - `run` 里不要同步、不要在主机上读 GPU 数据：它会被录进 graph。
 - 超参缺失、跑不了时在 `make` 里抛异常，这条链记「失败」并写 `error`。计划要求记「未运行」的情况（B3 的 cuda 没有超参的 56 条），用 `--only` 不跑它们，`publish.py` 自动记「未运行」，`note` 由发布者补写。
 - 在 `publish.py` 的 `IMPL_TEXT` 里加一句实现说明，写进 `run.json` 的 `config.impl`。
 - 命令行：`--impl cuda`。
+
+## triton-full（`--impl triton-full`）
+
+任务步骤 T4b 的探针：ksmm-triton 用作者注释掉的完整 autotune 空间，和 `triton`（6 个配置）比较。
+
+- **配置**：`src/ksmm_triton/ksmm_triton_tc.py:104-107` 把 `block_sizes`、`batch_sizes` 缩成 `[16]`、`[32]`。`triton_full.py` 用完整的 `[16, 32, 64, 128]`，num_warps、num_stages 的规则逐字照 `:109-137`，共 264 个配置（BLOCK_SIZE_B × BLOCK_SIZE_C × BLOCK_SIZE_BATCH 的 64 种组合；乘积 4096 的 1 种各 6 个，8192 的 3 种各 6 个，其余 60 种各 4 个）。
+- **不改 `src/`**：用原 kernel 的 `JITFunction`（`ks_fused_kernel.fn`）配上完整的配置重新包一个 `triton.autotune`，key 同为 `['a','b','c','d','B']`。前向是 `ks_triton_forward_impl` 的副本（`types.FunctionType`，同一份字节码），只把它全局名字 `ks_fused_kernel` 换成新的 autotuner。
+- **autotune 用时**：`triton`、`triton-full` 的第一次 eager run 在每级前后同步，记每级的墙钟秒数，写进 `time.jsonl` 的 `autotune_s`（列表，按级）。它含编译、autotune 的试跑和这一级本身的一次运行。冷编译要让 `TRITON_CACHE_DIR` 指向空目录：`run_host.sh` 把它设成 `$S/.triton`，所以给每次运行一个新的 `S`（`PY` 照旧）。同一进程里同一个 pattern 再出现时命中 autotune 缓存，用时接近 0。
+- 以后的 run（录 graph）不同步，计时口径和 `triton` 相同。
 
 ## ksmm-cuda（`--impl cuda`）
 
