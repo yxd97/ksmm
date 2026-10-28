@@ -5,18 +5,17 @@ between runs). A run applies the whole chain once to the input X (M_in, batch) a
 Y (N_out, batch), fp16, feature-major (BSL), stage 0 first, original dimensions. Weights and
 input come from a100_audit.Built / make_input (seed: crc32 of the chain name).
 
-Subcommands (run them through run_host.sh, which picks the GPU and wraps `time` in nsys):
+Subcommands (run them through run_host.sh, which picks the GPU):
 
   idle    idle power of the GPU in CUDA_VISIBLE_DEVICES; NVML only, no CUDA context.
   time    per chain: eager run + check, capture the n_runs graph + check, 3 warm-up replays,
-          then 5 replays inside one cudaProfilerStart/Stop range (one NVTX range per replay).
-  parse   export every nsys report of the output directory to sqlite and compute KNL, device
-          and DKL time per chain from the GPU timestamps of the kernels.
+          then R back-to-back replays with a CUDA event between replays, all submitted while a
+          wait kernel holds the GPU; device_us = event gap / n_runs. No tracing.
   power   per chain: pick power_n_runs (busy_pct >= 95 %), replay 120 s, energy from 30 s to 90 s.
 
-Outputs in --out: time.jsonl, timing.jsonl, power.jsonl, idle.jsonl (one row per chain or
-measurement, plus a provenance row per process), nsys/*.nsys-rep|sqlite, power-samples/*.csv.
-Each command skips chains already in its JSONL (resume). See README.md.
+Outputs in --out: time.jsonl, power.jsonl, idle.jsonl (one row per chain or measurement, plus
+a provenance row per process), power-samples/*.csv. Each command skips chains already in its
+JSONL (resume). See README.md.
 """
 from __future__ import annotations
 
@@ -26,7 +25,6 @@ import json
 import os
 import platform
 import socket
-import sqlite3
 import statistics
 import subprocess
 import sys
@@ -41,7 +39,12 @@ import a100_audit as audit  # noqa: E402  (also puts ksmm/src on sys.path)
 
 N_RUNS = 20  # runs per graph for timing
 WARMUP_REPLAYS = 3
-TRACED_REPLAYS = 5
+REPLAYS = 100  # timed replays R; fewer for long replays:
+LONG_REPLAY_MS = 10.0  # a replay longer than this gets R = about TIMED_TOTAL_MS of replays,
+TIMED_TOTAL_MS = 1000.0
+MIN_REPLAYS = 10  # but at least this many
+WAIT_CYCLES = 100_000_000  # first length of the wait kernel (torch.cuda._sleep), doubled when too short
+WAIT_TRIES = 6
 DENSE_REFERENCE = {"b1"}  # datasets checked against the fp32 composed matrix; others: einsum stage by stage
 POWER_S = 120.0  # replay (or idle) time per power measurement
 WINDOW = (30.0, 90.0)  # energy window, seconds after the start
@@ -111,13 +114,6 @@ def exit_if_busy(uuid: str) -> None:
         sys.exit(EXIT_BUSY)
 
 
-def tool_version(cmd: list[str]) -> str | None:
-    try:
-        return subprocess.run(cmd, capture_output=True, text=True).stdout.strip() or None
-    except OSError:
-        return None
-
-
 def provenance(clock, torch=None, triton=None) -> dict:
     from importlib import metadata
 
@@ -125,7 +121,6 @@ def provenance(clock, torch=None, triton=None) -> dict:
         "kind": "provenance", "time_utc": audit.utc_now(), "argv": sys.argv, "host": socket.gethostname(),
         "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
         "python": platform.python_version(), "python_executable": sys.executable,
-        "nsys": tool_version([os.environ["NSYS"], "--version"]) if os.environ.get("NSYS") else None,
         "loadavg_start": os.getloadavg(), "gpu_processes_start": gpu_processes(),
         **audit.git_state(), **clock.info(),
     }
@@ -167,6 +162,33 @@ def base_row(dataset: str, chain, args, uuid: str) -> dict:
 # --------------------------------------------------------------------------- time
 
 
+def timed_replays(torch, graph, replays: int) -> dict:
+    """`replays` back-to-back replays with a CUDA event before the first and after each one.
+
+    A wait kernel (torch.cuda._sleep) holds the GPU while the host submits all replays and
+    events, so the host cannot slow the GPU down. wait_ok: the first event had not completed when
+    the last submission returned, i.e. the wait kernel was still running; otherwise the wait is
+    doubled and the measurement repeated (at most WAIT_TRIES times).
+    """
+    cycles, tries, waited, host_ms, ev = WAIT_CYCLES, 0, False, 0.0, []
+    while not waited and tries < WAIT_TRIES:
+        if tries:
+            cycles *= 2
+        tries += 1
+        ev = [torch.cuda.Event(enable_timing=True) for _ in range(replays + 1)]
+        torch.cuda._sleep(cycles)
+        ev[0].record()
+        t0 = time.perf_counter()
+        for e in ev[1:]:
+            graph.replay()
+            e.record()
+        host_ms = (time.perf_counter() - t0) * 1000.0
+        waited = not ev[0].query()
+        torch.cuda.synchronize()
+    return {"replay_ms": [a.elapsed_time(b) for a, b in zip(ev, ev[1:])], "wait_ok": waited,
+            "wait_cycles": cycles, "wait_tries": tries, "host_submit_ms": host_ms}
+
+
 def cmd_time(args) -> None:
     torch, triton, dataset, chains, make, uuid, clock = setup(args)
     out = Path(args.out)
@@ -195,16 +217,19 @@ def cmd_time(args) -> None:
             ok = efin and gfin and erel <= audit.TOL_REL_L2 and grel <= audit.TOL_REL_L2
             row.update(eager_finite=efin, eager_rel_l2=erel, graph_finite=gfin, graph_rel_l2=grel,
                        rel_l2=max(erel, grel), check="通过" if ok else "失败")
+            warm = [torch.cuda.Event(enable_timing=True) for _ in range(2)]
+            warm[0].record()
             for _ in range(WARMUP_REPLAYS):
                 graph.replay()
+            warm[1].record()
             torch.cuda.synchronize()
-            torch.cuda.profiler.start()
-            for k in range(TRACED_REPLAYS):
-                torch.cuda.nvtx.range_push(f"{chain.name}/r{k}")
-                graph.replay()
-                torch.cuda.nvtx.range_pop()
-            torch.cuda.synchronize()
-            torch.cuda.profiler.stop()
+            per_ms = warm[0].elapsed_time(warm[1]) / WARMUP_REPLAYS
+            replays = REPLAYS if per_ms <= LONG_REPLAY_MS else max(MIN_REPLAYS, round(TIMED_TOTAL_MS / per_ms))
+            res = timed_replays(torch, graph, replays)
+            dev = [ms * 1000.0 / args.n_runs for ms in res["replay_ms"]]
+            p20, p50, p80 = audit.quantiles(dev)
+            row.update(device_us=p50, device_p20=p20, device_p80=p80, replays=replays, warmup_replay_ms=per_ms,
+                       **res)
         except Exception as exc:  # record and go on with the next chain
             row.update(check="失败", error=f"{type(exc).__name__}: {str(exc)[:2000]}")
         finally:
@@ -215,121 +240,9 @@ def cmd_time(args) -> None:
         row["elapsed_s"] = round(time.perf_counter() - started, 3)
         audit.write_jsonl(path, row)
         print(f"time {chain.name:36s} {row['check']} rel={row.get('rel_l2', float('nan')):.2e} "
+              f"device={row.get('device_us', float('nan')):.3f} us (p20 {row.get('device_p20', float('nan')):.3f}, "
+              f"p80 {row.get('device_p80', float('nan')):.3f}) R={row.get('replays')} wait_ok={row.get('wait_ok')} "
               f"cfg={row.get('config', '')} {row.get('error', '')}", flush=True)
-
-
-# --------------------------------------------------------------------------- parse
-
-
-def parse_report(sqlite_path: Path, time_rows: dict) -> list[dict]:
-    """KNL, device and DKL per chain from one exported nsys report.
-
-    A kernel belongs to replay r<k> of a chain when the CUDA API call that launched it (same
-    correlationId: the cudaGraphLaunch of that replay) starts inside the NVTX range `<chain>/r<k>`
-    on the same thread. The NVTX range is host time and ends before the kernels run, so it only
-    selects the cudaGraphLaunch call, never kernels by GPU time. A replay's kernels are put in
-    graph node order (graphNodeId, assigned in capture order = launch order; GPU start times of
-    neighbours can overlap by tens of ns) and cut into n_runs runs of `stages` kernels.
-    """
-    db = sqlite3.connect(sqlite_path)
-    cur = db.cursor()
-    strings = dict(cur.execute("SELECT id, value FROM StringIds"))
-    tables = {r[0] for r in cur.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-    ranges: dict[str, list] = {}
-    for start, end, text, text_id, tid in cur.execute(
-            "SELECT start, end, text, textId, globalTid FROM NVTX_EVENTS WHERE end IS NOT NULL AND eventType = 59"):
-        label = text if text is not None else strings.get(text_id, "")
-        if "/r" in label:
-            chain, k = label.rsplit("/r", 1)
-            ranges.setdefault(chain, []).append((int(k), start, end, tid))
-    api = sorted(cur.execute("SELECT start, correlationId, globalTid FROM CUPTI_ACTIVITY_KIND_RUNTIME"))
-    kernels: dict[int, list] = {}
-    for node, start, end, corr, gx, gy, gz in cur.execute(
-            "SELECT graphNodeId, start, end, correlationId, gridX, gridY, gridZ FROM CUPTI_ACTIVITY_KIND_KERNEL"):
-        kernels.setdefault(corr, []).append((node, start, end, f"{gx}x{gy}x{gz}"))
-    others: dict[int, int] = {}
-    for table in ("CUPTI_ACTIVITY_KIND_MEMSET", "CUPTI_ACTIVITY_KIND_MEMCPY"):
-        if table in tables:
-            for (corr,) in cur.execute(f"SELECT correlationId FROM {table}"):
-                others[corr] = others.get(corr, 0) + 1
-    import bisect
-
-    starts = [a[0] for a in api]
-    rows = []
-    for chain, reps in ranges.items():
-        t = time_rows.get(chain)
-        if t is None or "n_runs" not in t:
-            continue  # no finished time row: the chain gets measured again
-        stages, n = t["stages"], t["n_runs"]
-        knl, device, dkl, problems, grids = [], [], [], [], None
-        other_ops = knl_gt_device = start_inversions = overlaps = 0
-        for k, r_start, r_end, tid in sorted(reps):
-            lo, hi = bisect.bisect_left(starts, r_start), bisect.bisect_right(starts, r_end)
-            acts = []
-            for _s, corr, a_tid in api[lo:hi]:
-                if a_tid == tid:
-                    acts.extend(kernels.get(corr, []))
-                    other_ops += others.get(corr, 0)
-            acts.sort()  # graph node order
-            start_inversions += sum(b[1] < a[1] for a, b in zip(acts, acts[1:]))
-            overlaps += sum(b[1] < a[2] for a, b in zip(acts, acts[1:]))
-            if len(acts) != n * stages:
-                problems.append(f"r{k}: {len(acts)} kernels, expected {n}x{stages}")
-                continue
-            runs = [acts[i * stages:(i + 1) * stages] for i in range(n)]
-            for j, run in enumerate(runs):
-                g = " ".join(a[3] for a in run)
-                grids = grids or g
-                if g != grids:
-                    problems.append(f"r{k} run {j}: grids {g} differ from {grids}")
-                knl_us = sum(e - s for _n, s, e, _g in run) / 1000.0
-                knl.append(knl_us)
-                if j:  # the first run of a replay follows the graph launch: KNL only
-                    dev_us = (run[-1][2] - runs[j - 1][-1][2]) / 1000.0
-                    device.append(dev_us)
-                    dkl.append(dev_us - knl_us)
-                    knl_gt_device += knl_us > dev_us
-        row = {"kind": "timing", "chain": chain, "impl": t["impl"], "batch": t["batch"],
-               "report": sqlite_path.with_suffix(".nsys-rep").name, "replays": len(reps),
-               "kernels": stages if knl else None, "grids": grids, "other_ops": other_ops,
-               "knl_n": len(knl), "device_n": len(device), "knl_gt_device": knl_gt_device,
-               "start_inversions": start_inversions, "overlaps": overlaps}
-        if knl and device:
-            (k20, k50, k80), (d20, d50, d80) = audit.quantiles(knl), audit.quantiles(device)
-            row.update(knl_us=k50, knl_p20=k20, knl_p80=k80, device_us=d50, device_p20=d20, device_p80=d80,
-                       dkl_us=statistics.median(dkl))
-        if len(reps) != TRACED_REPLAYS:
-            problems.append(f"{len(reps)} NVTX replay ranges, expected {TRACED_REPLAYS}")
-        if other_ops:
-            problems.append(f"{other_ops} memset/memcpy in the replays")
-        row["problems"] = problems
-        rows.append(row)
-    db.close()
-    return rows
-
-
-def cmd_parse(args) -> None:
-    out = Path(args.out)
-    path = out / "timing.jsonl"
-    time_rows = latest(out / "time.jsonl", "point")
-    parsed = {r["report"] for r in read_rows(path, "timing")}
-    def order(rep: Path):  # time-<stamp>.<k>.nsys-rep, k = 1, 2, ... per cudaProfilerStart/Stop range
-        stamp, k = rep.name.split(".")[:2]
-        return stamp, int(k)
-
-    for rep in sorted((out / "nsys").glob("*.nsys-rep"), key=order):
-        if rep.name in parsed:
-            continue
-        sql = rep.with_suffix(".sqlite")
-        if not sql.exists():
-            subprocess.run([os.environ["NSYS"], "export", "--type", "sqlite", "--force-overwrite=true",
-                            "-o", str(sql), str(rep)], check=True, stdout=subprocess.DEVNULL)
-        for row in parse_report(sql, time_rows):
-            audit.write_jsonl(path, row)
-            print(f"parse {row['chain']:36s} knl={row.get('knl_us', float('nan')):9.3f} "
-                  f"device={row.get('device_us', float('nan')):9.3f} dkl={row.get('dkl_us', float('nan')):8.3f} "
-                  f"kernels={row['kernels']} n={row['knl_n']}/{row['device_n']} {' ; '.join(row['problems'])}",
-                  flush=True)
 
 
 # --------------------------------------------------------------------------- power
@@ -453,7 +366,7 @@ def cmd_power(args) -> None:
     path = out / "power.jsonl"
     audit.write_jsonl(path, provenance(clock, torch, triton))
     done = audit.done_keys(path)
-    timing = latest(out / "timing.jsonl", "timing")
+    timing = latest(out / "time.jsonl", "point")
     for chain in chains:
         if (dataset, chain.name, args.impl, args.batch) in done:
             continue
@@ -461,7 +374,7 @@ def cmd_power(args) -> None:
         started = time.perf_counter()
         row = base_row(dataset, chain, args, uuid)
         try:
-            device_us = timing[chain.name]["device_us"]  # KeyError: time and parse this chain first
+            device_us = timing[chain.name]["device_us"]  # KeyError: time this chain first
             built = audit.Built(torch, chain)
             x = audit.make_input(torch, chain, args.batch)
             impl = make(torch, built, x)
@@ -524,10 +437,9 @@ def main() -> None:
         if name == "time":
             s.add_argument("--n-runs", type=int, default=N_RUNS)
         s.set_defaults(fn=fn)
-    for name, fn in (("idle", cmd_idle), ("parse", cmd_parse)):
-        s = sub.add_parser(name)
-        s.add_argument("--out", required=True, help="output directory of this run")
-        s.set_defaults(fn=fn)
+    s = sub.add_parser("idle")
+    s.add_argument("--out", required=True, help="output directory of this run")
+    s.set_defaults(fn=cmd_idle)
     args = p.parse_args()
     args.fn(args)
 
