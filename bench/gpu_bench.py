@@ -63,21 +63,44 @@ EXIT_BUSY = 75  # another process is on the GPU
 class Impl(NamedTuple):
     run: Callable[[], object]  # one run: the whole chain on x once -> (N_out, batch) fp16 tensor
     config: Callable[[], str]  # kernel configuration used; called after the first (eager) run
+    autotune_s: Callable[[], list] = list  # wall seconds of each stage in the first (eager) run, if timed
 
 
-def make_triton(torch, built, x) -> Impl:
-    """KSMM-Triton: ks_triton_forward_impl per stage, K of shape (A*D, C, B), BSL layout."""
-    from ksmm_triton.ksmm_triton_tc import ks_fused_kernel, ks_triton_forward_impl
-
+def triton_impl(torch, built, x, forward, kernel) -> Impl:
+    """One `forward` call per stage, K of shape (A*D, C, B), BSL layout. The first call (the
+    eager run of cmd_time, where Triton compiles and autotunes) synchronizes around each stage
+    and records its wall time; later calls (graph capture) do not synchronize."""
     plan = list(zip(built.chain.stages, built.k_bmm))
+    stage_s: list = []
 
     def run():
         y = x
         for pattern, k in plan:
-            y = ks_triton_forward_impl(y, k, pattern, layout="BSL")
+            if len(stage_s) < len(plan):
+                torch.cuda.synchronize()
+                t0 = time.perf_counter()
+                y = forward(y, k, pattern, layout="BSL")
+                torch.cuda.synchronize()
+                stage_s.append(round(time.perf_counter() - t0, 3))
+            else:
+                y = forward(y, k, pattern, layout="BSL")
         return y
 
-    return Impl(run, lambda: audit.ksmm_configs(ks_fused_kernel, built.chain, x.shape[1]))
+    return Impl(run, lambda: audit.ksmm_configs(kernel, built.chain, x.shape[1]), lambda: stage_s)
+
+
+def make_triton(torch, built, x) -> Impl:
+    """KSMM-Triton: ks_triton_forward_impl per stage with the author's 6 configs."""
+    from ksmm_triton.ksmm_triton_tc import ks_fused_kernel, ks_triton_forward_impl
+
+    return triton_impl(torch, built, x, ks_triton_forward_impl, ks_fused_kernel)
+
+
+def make_triton_full(torch, built, x) -> Impl:
+    """KSMM-Triton with the full (commented-out) autotune space, 264 configs (triton_full.py)."""
+    from triton_full import ks_fused_kernel_full, ks_triton_forward_full
+
+    return triton_impl(torch, built, x, ks_triton_forward_full, ks_fused_kernel_full)
 
 
 def make_cuda(torch, built, x) -> Impl:
@@ -89,7 +112,7 @@ def make_cuda(torch, built, x) -> Impl:
 
 # name -> make(torch, built, x) -> Impl. built: a100_audit.Built (built.chain; built.w4: fp16
 # (A, B, C, D) weights per stage; built.k_bmm: the same as (A*D, C, B)); x: (M_in, batch) fp16.
-IMPLS: dict[str, Callable] = {"triton": make_triton, "cuda": make_cuda}
+IMPLS: dict[str, Callable] = {"triton": make_triton, "triton-full": make_triton_full, "cuda": make_cuda}
 
 
 # --------------------------------------------------------------------------- helpers
@@ -235,6 +258,8 @@ def cmd_time(args) -> None:
             torch.cuda.synchronize()
             efin, erel, _ = audit.rel_errors(torch, y, ref)
             row["config"] = impl.config()
+            if impl.autotune_s():
+                row["autotune_s"] = impl.autotune_s()
             run = impl.run
             graph, gy = audit.capture_graph(torch, lambda r=run: run_set(r, args.n_runs))
             gfin, grel, _ = audit.rel_errors(torch, gy, ref)
