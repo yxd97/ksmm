@@ -4,8 +4,10 @@ The extension is loaded from $KSMM_CUDA_BUILD, default $S/ksmm-cuda-build (build
 """
 from __future__ import annotations
 
+import hashlib
 import importlib.machinery
 import importlib.util
+import json
 import os
 from pathlib import Path
 
@@ -13,12 +15,27 @@ NAME = "ksmm_cuda_bsl_half"
 _ext = None
 
 
+def build_dir() -> Path:
+    return Path(os.environ.get("KSMM_CUDA_BUILD") or Path(os.environ["S"]) / "ksmm-cuda-build")
+
+
+def build_info() -> dict:
+    """manifest.json of the build (nvcc, arch, sha256 of the .best, the template and the .so).
+
+    Refuses a manifest whose so_sha256 is not the .so on disk (stale manifest).
+    """
+    info = json.loads((build_dir() / "manifest.json").read_text(encoding="utf-8"))
+    so = build_dir() / "build" / f"{NAME}.so"
+    if hashlib.sha256(so.read_bytes()).hexdigest() != info.get("so_sha256"):
+        raise RuntimeError(f"{so} does not match the so_sha256 of manifest.json; rebuild with build.py")
+    return info
+
+
 def extension():
     """The built extension module (import torch first)."""
     global _ext
     if _ext is None:
-        build = Path(os.environ.get("KSMM_CUDA_BUILD") or Path(os.environ["S"]) / "ksmm-cuda-build")
-        so = build / "build" / f"{NAME}.so"
+        so = build_dir() / "build" / f"{NAME}.so"
         loader = importlib.machinery.ExtensionFileLoader(NAME, str(so))
         spec = importlib.util.spec_from_file_location(NAME, so, loader=loader)
         if spec is None:

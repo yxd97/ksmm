@@ -182,9 +182,9 @@ mkdir -p $S/ksmm-cuda-build
 $S/venv-cu126/bin/python <ksmm>/bench/ksmm_cuda/build.py --out $S/ksmm-cuda-build --jobs 8 > $S/ksmm-cuda-build/build.log 2>&1
 ```
 
-- 输出：`$S/ksmm-cuda-build/src/`（生成的源文件）、`build/ksmm_cuda_bsl_half.so`（ninja 构建，`torch.utils.cpp_extension.load`）、`manifest.json`（pattern 数、组合数、`.best` 和模板的 sha256、nvcc 和 torch 版本、用时）。
+- 输出：`$S/ksmm-cuda-build/src/`（生成的源文件）、`build/ksmm_cuda_bsl_half.so`（ninja 构建，`torch.utils.cpp_extension.load`）、`manifest.json`（pattern 数、组合数、编译目标 `sm_86`、`.best`、模板和 `.so` 的 sha256、nvcc 和 torch 版本、用时）。
 - `TORCH_CUDA_ARCH_LIST=8.6` 由 `build.py` 设置，只生成 `sm_86`。并行度 `--jobs`（即 `MAX_JOBS`）默认 8：机器有 48 核，别人也在用，8 个已经够快。
-- 用时（2026-10-27 22:51 EDT，`--jobs 8`，负载约 3）：`build_s` 17.3 s，`/usr/bin/time` 的 wall 19.06 s。每个 `cfgNN.cu` 约 1.6–2.8 s，`binding.cpp`（含 torch 头文件）16.9 s，是关键路径。
+- 用时（2026-10-27 23:07 EDT 清空后重编，`--jobs 8`，负载约 2.3–2.8）：`build_s` 17.4 s，`/usr/bin/time` 的 wall 19.22 s（22:51 EDT 的第一次全量编译是 17.3 s）。每个 `cfgNN.cu` 约 1.6–2.8 s，`binding.cpp`（含 torch 头文件）16.9 s，是关键路径。
 - 估算（同一天 22:50 EDT）：先用 `--limit 10`（前 10 个 pattern，2 种组合）编到另一个目录，用了 17.0 s。按组合算全量约 50 × 1.6 s ÷ 8 + 17 s，远低于 8 小时。
 - `--limit N` 只用于估算，正式构建不用。
 
@@ -198,6 +198,7 @@ $B/run_host.sh <卡号> $S/gpu-bench/b3-a6000-ksmm-cuda "gpu-bench b3 cuda" time
 ```
 
 - 扩展从 `$KSMM_CUDA_BUILD/build/ksmm_cuda_bsl_half.so` 加载，没设 `KSMM_CUDA_BUILD` 时用 `$S/ksmm-cuda-build`。运行时不需要 nvcc。
+- 溯源：`time.jsonl` 的 provenance 行多一个 `cuda_build`，就是同一构建目录的 `manifest.json`。读它时核对 `.so` 的 sha256，和 manifest 不符就报错（要重编）。`publish.py` 把它写进 `run.json` 的 `config.cuda_build`。
 - `--covered` 只用标准库，也能在 zhang-22 上用 `python3` 跑。B3 的 728 条里 672 条有超参；其余 56 条不跑，`publish.py` 记「未运行」，`note` 由发布者补写「没有 batch=25088 的 fp16 bs_last 超参」。
 - `config` 字段是每级的超参：`TILEX×TILEK×TILEY/tTX×TY/vVSIZE`，例如 `16x16x128/t8x4/v4`。
 

@@ -159,7 +159,7 @@ def generate(out: Path, limit: int | None) -> tuple[list[Path], dict]:
         path = src / f"cfg{k:02d}.cu"
         path.write_text(unit_source(k, hp), encoding="utf-8")
         sources.append(path)
-    info = {"patterns": len(table), "kernel_configs": len(cfg_id), "batch": BATCH, "arch": ARCH,
+    info = {"patterns": len(table), "kernel_configs": len(cfg_id), "batch": BATCH, "arch": f"sm_{ARCH.replace('.', '')}",
             "best": str(BEST.relative_to(ROOT)), "best_sha256": sha256(BEST),
             "template": str(TEMPLATE.relative_to(ROOT)), "template_sha256": sha256(TEMPLATE)}
     return sources, info
@@ -182,9 +182,10 @@ def build(out: Path, limit: int | None, jobs: int) -> None:
     load(name=NAME, sources=[str(s) for s in sources], build_directory=str(build_dir),
          extra_cuda_cflags=[f"-I{KS}"], verbose=True)
     seconds = time.perf_counter() - t0
+    so = build_dir / f"{NAME}.so"
     info.update(built_utc=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), build_s=round(seconds, 1),
                 jobs=jobs, cuda_home=cuda_home, nvcc=nvcc, torch=torch.__version__, torch_cuda=torch.version.cuda,
-                so=str(build_dir / f"{NAME}.so"))
+                so=str(so), so_sha256=sha256(so))
     (out / "manifest.json").write_text(json.dumps(info, indent=1) + "\n", encoding="utf-8")
     print(json.dumps(info), flush=True)
 

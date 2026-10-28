@@ -213,7 +213,12 @@ def cmd_time(args) -> None:
     torch, triton, dataset, chains, make, uuid, clock = setup(args)
     out = Path(args.out)
     path = out / "time.jsonl"
-    audit.write_jsonl(path, provenance(clock, torch, triton))
+    prov = provenance(clock, torch, triton)
+    if args.impl == "cuda":
+        import ksmm_cuda
+
+        prov["cuda_build"] = ksmm_cuda.build_info()
+    audit.write_jsonl(path, prov)
     done = audit.done_keys(path)
     for chain in chains:
         if (dataset, chain.name, args.impl, args.batch) in done:

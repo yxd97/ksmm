@@ -174,6 +174,9 @@ def main() -> None:
         "measured_tree_dirty": prov["ksmm_dirty"],
         "sessions": sessions,
     }
+    builds = [x["cuda_build"] for x in provs if "cuda_build" in x]
+    if builds:  # ksmm-cuda: manifest.json of the extension build, one per distinct build
+        config["cuda_build"] = builds[0] if all(b == builds[0] for b in builds) else builds
     if with_power:
         config["power"] = POWER_TEXT
         config["idle"] = [{"gpu_uuid": u, "p_idle_w": w, "time_utc": tt} for u, w, tt in used_idle]
