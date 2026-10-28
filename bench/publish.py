@@ -43,6 +43,10 @@ IMPL_TEXT = {
     "triton": ("KSMM-Triton：每级调用一次 ks_triton_forward_impl(x, K, (A,B,C,D), layout='BSL')，K 的形状 (A·D, C, B)。"
                "录 graph 前先 eager 调用一次，Triton autotune 在这时选配置（TRITON_CACHE_AUTOTUNING=1 存盘），"
                "选中的配置记在 time.jsonl 的 config 字段"),
+    "cuda": ("KSMM-CUDA：ksmm 自带的 bs_last fp16 kernel 模板（template_kernels_half.cuh，fp16 累加），每级启动一次，"
+             "权重排成 (A·D·C, B)。超参只取 kernel_bs_last_half.best 里 batch=25088 的条目，不用回退搜索；"
+             "由 bench/ksmm_cuda/build.py 生成分派表和 torch 扩展，编译目标 sm_86，在当前 CUDA stream 上启动。"
+             "超参记在 time.jsonl 的 config 字段（TILEX×TILEK×TILEY/tTX×TY/vVSIZE）"),
 }
 TIMING_TEXT = (f"每条链录一个 CUDA graph，里面 {gb.N_RUNS} 个首尾相接的 run，run 之间不清 L2。热身：像功率阶段那样连续回放 "
                f"W = {gb.WARMUP_S} s（主机最多领先 {gb.LEAD} 次），让 GPU 升到稳定频率（W 的标定见 ksmm bench/README.md）。"

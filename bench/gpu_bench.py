@@ -80,9 +80,16 @@ def make_triton(torch, built, x) -> Impl:
     return Impl(run, lambda: audit.ksmm_configs(ks_fused_kernel, built.chain, x.shape[1]))
 
 
+def make_cuda(torch, built, x) -> Impl:
+    """KSMM-CUDA: ksmm's bs_last fp16 kernels, batch 25088 hyperparameters only (ksmm_cuda/build.py)."""
+    import ksmm_cuda
+
+    return Impl(*ksmm_cuda.make(torch, built, x))
+
+
 # name -> make(torch, built, x) -> Impl. built: a100_audit.Built (built.chain; built.w4: fp16
 # (A, B, C, D) weights per stage; built.k_bmm: the same as (A*D, C, B)); x: (M_in, batch) fp16.
-IMPLS: dict[str, Callable] = {"triton": make_triton}
+IMPLS: dict[str, Callable] = {"triton": make_triton, "cuda": make_cuda}
 
 
 # --------------------------------------------------------------------------- helpers
