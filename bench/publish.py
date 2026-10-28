@@ -40,9 +40,16 @@ COLUMNS = {
     "note": "失败原因、换卡、偏差",
 }
 IMPL_TEXT = {
-    "triton": ("KSMM-Triton：每级调用一次 ks_triton_forward_impl(x, K, (A,B,C,D), layout='BSL')，K 的形状 (A·D, C, B)。"
+    "triton": ("KSMM-Triton，作者发布的 6 个 autotune 配置（ksmm_triton_tc.py:104-107：BLOCK 16，BATCH 32）："
+               "每级调用一次 ks_triton_forward_impl(x, K, (A,B,C,D), layout='BSL')，K 的形状 (A·D, C, B)。"
                "录 graph 前先 eager 调用一次，Triton autotune 在这时选配置（TRITON_CACHE_AUTOTUNING=1 存盘），"
                "选中的配置记在 time.jsonl 的 config 字段"),
+    "triton-full": ("KSMM-Triton，完整 autotune 范围 264 个配置（bench/triton_full.py：作者注释掉的 BLOCK、BATCH 都取 "
+                    "16、32、64、128，num_warps、num_stages 的规则照 ksmm_triton_tc.py:109-137；kernel 不变）："
+                    "每级调用一次 ks_triton_forward_impl 的副本（只把 ks_fused_kernel 换成完整范围的 autotuner），"
+                    "K 的形状 (A·D, C, B)，layout='BSL'。录 graph 前先 eager 调用一次，Triton autotune 在这时选配置"
+                    "（TRITON_CACHE_AUTOTUNING=1 存盘，power 用同一个 TRITON_CACHE_DIR 读回），"
+                    "选中的配置记在 time.jsonl 的 config 字段，每级的 autotune 用时记在 autotune_s"),
     "cuda": ("KSMM-CUDA：ksmm 自带的 bs_last fp16 kernel 模板（template_kernels_half.cuh，fp16 累加），每级启动一次，"
              "权重排成 (A·D·C, B)。超参只取 kernel_bs_last_half.best 里 batch=25088 的条目，不用回退搜索；"
              "由 bench/ksmm_cuda/build.py 生成分派表和 torch 扩展，编译目标 sm_86，在当前 CUDA stream 上启动。"
