@@ -21,15 +21,15 @@ flowchart LR
 
 ## 用法
 
-在 GPU 主机上（以 zhang-x4 为例；zhang-capra-xcel 换成它的 `$S` 和 Python）：
+在 GPU 主机上（以 zhang-x4 为例；zhang-capra-xcel 换成它的 `$S` 和 Python）。x4 用物理 GPU0：GPU1 的 SM 时钟被锁在 1065 MHz。B1 用 `--impl triton-full`，B2、B3 用 `--impl triton`：
 
 ```bash
 export S=/scratch/users/phd/yd383/kroissant-project/scratch
 export PY=/scratch/users/phd/yd383/venv-cu126/bin/python
 B=$S/ksmm-gpu-bench/bench; O=$S/gpu-bench/b1-a100-ksmm-triton; C=$S/datasets/b1/chains.csv
-$B/run_host.sh 1 $O "gpu-bench idle" idle                                   # 1. 待机功率（每张卡一次）
-$B/run_host.sh 1 $O "gpu-bench b1 time" time --chains $C --batch 1          # 2. 计时
-$B/run_host.sh 1 $O "gpu-bench b1 power" power --chains $C --batch 1        # 3. 功率（只 B1，要先有计时）
+$B/run_host.sh 0 $O "gpu-bench idle" idle                                                  # 1. 待机功率（每张卡一次）
+$B/run_host.sh 0 $O "gpu-bench b1 time" time --impl triton-full --chains $C --batch 1      # 2. 计时
+$B/run_host.sh 0 $O "gpu-bench b1 power" power --impl triton-full --chains $C --batch 1    # 3. 功率（只 B1，要先有计时）
 ```
 
 - `run_host.sh <物理 GPU 编号> <输出目录> "<说明>" <子命令> [参数]`。环境变量 `S`、`PY` 必须设。
@@ -37,7 +37,7 @@ $B/run_host.sh 1 $O "gpu-bench b1 power" power --chains $C --batch 1        # 3.
   - 卡上有别人的进程就退出，退出码 75。`time`、`power` 每条链开始前再查一次，`idle` 前后各查一次；查到就以 75 退出，已写的行保留。
   - 主机名是 `en-ec-zhang-x4` 时，开始、结束各往 `/scratch/users/gpu-use-log/$USER.log` 写一行。其他主机不写。
   - nvidia-smi 每 200 ms 采样，存为 `<输出目录>/smi-<子命令>-<时间>.csv`。
-- `time`、`power` 的参数：`--chains <数据集>/chains.csv`（数据集名取目录名）、`--only a,b,c`、`--impl triton` 或 `cuda`、`--batch`（B1、B2 是 1，B3 是 25088）、`--n-runs`（只 `time`，默认 20）。
+- `time`、`power` 的参数：`--chains <数据集>/chains.csv`（数据集名取目录名）、`--only a,b,c`、`--impl triton`、`triton-full` 或 `cuda`（默认 `triton`）、`--batch`（B1、B2 是 1，B3 是 25088）、`--n-runs`（只 `time`，默认 20）。
 - 断点续测：每条链结束写一行 JSONL。重跑同一条命令，已有行的链跳过。
 - 发布（在 zhang-22 上，先把输出目录 rsync 回来）：
 
